@@ -1,7 +1,18 @@
-# Tauri + React
+# RFID App - Tauri + React
 
-This template should help get you started developing with Tauri and React in Vite.
+Sistema de lectura RFID con interfaz 3D industrial.
 
-## Recommended IDE Setup
+## Tecnologías
+- React
+- Tauri
+- Rust
+- Three.js
 
-- [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+## Ejecutar
+npm install
+npm run tauri dev
+
+## Para generar ejecutable
+### Windows
+npm install
+npm run tauri build
