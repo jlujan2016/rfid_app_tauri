@@ -2,13 +2,15 @@ use bcrypt::{hash, verify, DEFAULT_COST};
 use rusqlite::{Connection, params};
 use std::sync::Mutex;
 use tauri::{Manager, State};
+use tiberius::{AuthMethod, Client, Config};
+use tokio::net::TcpStream;
+use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 // ─── ESTADO GLOBAL ───────────────────────────────────────────────────────────
 pub struct DbState(pub Mutex<Connection>);
 
 // ─── INICIALIZAR BASE DE DATOS ────────────────────────────────────────────────
 fn init_db(conn: &Connection) {
-    // Crear tabla users idéntica a SQL Server
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS users (
             id            INTEGER PRIMARY KEY,
@@ -19,7 +21,6 @@ fn init_db(conn: &Connection) {
     )
     .expect("Error creando tabla users");
 
-    // Insertar usuario admin por defecto solo si no existe
     let count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM users WHERE username = 'admin'",
@@ -51,7 +52,6 @@ fn saludar(nombre: &str) -> String {
 #[tauri::command]
 fn login(state: State<DbState>, user: String, pass: String) -> bool {
     let conn = state.0.lock().unwrap();
-
     // Buscar el hash del usuario en SQLite
     let result = conn.query_row(
         "SELECT password_hash FROM users WHERE username = ?1",
@@ -60,12 +60,63 @@ fn login(state: State<DbState>, user: String, pass: String) -> bool {
     );
 
     match result {
-        Ok(password_hash) => {
-            // Verificar la contraseña contra el hash bcrypt
-            verify(&pass, &password_hash).unwrap_or(false)
-        }
-        Err(_) => false, // usuario no encontrado
+        Ok(password_hash) => verify(&pass, &password_hash).unwrap_or(false),
+        
+        Err(_) => false,
     }
+}
+
+// ─── COMANDO SINCRONIZAR ──────────────────────────────────────────────────────
+#[tauri::command]
+async fn sincronizar(state: State<'_, DbState>) -> Result<String, String> {
+    // Configurar conexión a SQL Server
+    let mut config = Config::new();
+    config.host("0_Ciberelectrik.mssql.somee.com");
+    config.port(1433);
+    config.database("0_Ciberelectrik");
+    config.authentication(AuthMethod::sql_server("jlujan_SQLLogin_1", "yyeftklvtf"));
+    config.trust_cert();
+
+    // Conectar a SQL Server
+    let tcp = TcpStream::connect(config.get_addr())
+        .await
+        .map_err(|e| format!("Error conectando al servidor: {}", e))?;
+
+    let mut client = Client::connect(config, tcp.compat_write())
+        .await
+        .map_err(|e| format!("Error autenticando en SQL Server: {}", e))?;
+
+    // Traer usuarios de SQL Server
+    let rows = client
+        .query("SELECT id, username, password_hash FROM users", &[])
+        .await
+        .map_err(|e| format!("Error consultando usuarios: {}", e))?
+        .into_first_result()
+        .await
+        .map_err(|e| format!("Error leyendo resultados: {}", e))?;
+
+    // Actualizar SQLite local
+    let conn = state.0.lock().unwrap();
+    let mut sincronizados = 0;
+
+    for row in &rows {
+        //let id: i32 = row.get(0).unwrap_or(0);
+        let username: &str = row.get(1).unwrap_or("");
+        let password_hash: &str = row.get(2).unwrap_or("");
+
+        conn.execute(
+            "INSERT INTO users (username, password_hash, created_at)
+            VALUES (?1, ?2, datetime('now'))
+            ON CONFLICT(username) DO UPDATE SET
+                password_hash = excluded.password_hash",
+            params![username, password_hash],
+        )
+        .map_err(|e| format!("Error actualizando SQLite: {}", e))?;
+
+        sincronizados += 1;
+    }
+
+    Ok(format!("✅ {} usuarios sincronizados correctamente", sincronizados))
 }
 
 // ─── ENTRY POINT ─────────────────────────────────────────────────────────────
@@ -74,7 +125,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            // Ruta de la BD: funciona igual en desktop, Android e iOS
+             // Ruta de la BD: funciona igual en desktop, Android e iOS
             let db_path = app
                 .path()
                 .app_data_dir()
@@ -85,19 +136,16 @@ pub fn run() {
                 // Crear la carpeta si no existe
             std::fs::create_dir_all(db_path.parent().unwrap())
                 .expect("Error creando directorio de la BD");
-
             // Abrir o crear la base de datos
             let conn = Connection::open(&db_path).expect("Error abriendo SQLite");
-
             // Inicializar tablas y usuario por defecto
             init_db(&conn);
-
             // Registrar el estado global
             app.manage(DbState(Mutex::new(conn)));
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![saludar, login])
+        .invoke_handler(tauri::generate_handler![saludar, login, sincronizar])
         .run(tauri::generate_context!())
         .expect("Error iniciando Tauri");
 }
