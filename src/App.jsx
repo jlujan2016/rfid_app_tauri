@@ -2,6 +2,7 @@ import { useState } from "react";
 import "./App.css";
 import Login from "./login";
 import InventoryDashboard from "./InventoryDashboard";
+import RfidTest from "./RfidTest";
 
 function App() {
   const [logged, setLogged] = useState(false);

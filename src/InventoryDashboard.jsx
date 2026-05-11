@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import "./InventoryDashboard.css";
 
 function InventoryDashboard() {
@@ -43,39 +44,43 @@ function InventoryDashboard() {
     }
   };
 
-  // Simulación de escaneo RFID
+  // Lógica Real de Escaneo RFID
   useEffect(() => {
-    if (isScanning) {
-      scanInterval.current = setInterval(() => {
-        setInventory(prev => {
-          // Encontrar los ítems faltantes que corresponden al almacén seleccionado
-          const missingItems = prev.filter(item => 
-            item.status === "missing" && 
-            (selectedAlmacen === "Todos" || (item.almacen || "Sin Almacén") === selectedAlmacen)
-          );
-          
-          if (missingItems.length === 0) {
-            clearInterval(scanInterval.current);
-            setIsScanning(false);
-            return prev;
+    const unlistenTag = listen("tag_leido", (event) => {
+      const epc = event.payload;
+      
+      setInventory(prev => {
+        let changed = false;
+        const newInv = prev.map(item => {
+          // Si el código recibido de la antena coincide exactamente con el código_rfid de la base de datos
+          if (item.codigo_rfid === epc && item.status !== "found") {
+            changed = true;
+            return { ...item, status: "found" };
           }
-          
-          const randomIndex = Math.floor(Math.random() * missingItems.length);
-          const itemToScan = missingItems[randomIndex];
-          
-          setScanCount(count => count + 1);
-          
-          return prev.map(item => 
-            item.codigo_rfid === itemToScan.codigo_rfid ? { ...item, status: "found" } : item
-          );
+          return item;
         });
-      }, 800); 
-    } else {
-      clearInterval(scanInterval.current);
-    }
 
-    return () => clearInterval(scanInterval.current);
-  }, [isScanning, selectedAlmacen]);
+        if (changed) {
+          setScanCount(c => c + 1);
+        }
+        return newInv;
+      });
+    });
+
+    const unlistenEstado = listen("rfid_estado", (event) => {
+      if (event.payload === "detenido") {
+        setIsScanning(false);
+      } else if (event.payload === "conectado") {
+        setIsScanning(true);
+      }
+    });
+
+    const unlistenPromises = [unlistenTag, unlistenEstado];
+
+    return () => {
+      unlistenPromises.forEach((fn) => fn.then((f) => f()));
+    };
+  }, []);
 
   // Lista de almacenes únicos
   const almacenes = ["Todos", ...new Set(inventory.map(item => item.almacen || "Sin Almacén").filter(Boolean))];
@@ -85,18 +90,27 @@ function InventoryDashboard() {
     selectedAlmacen === "Todos" || (item.almacen || "Sin Almacén") === selectedAlmacen
   );
 
-  const toggleScan = () => {
-    if (!isScanning && filteredInventory.every(i => i.status === "found")) {
-      // Reiniciar si ya se encontró todo en el almacén actual
-      setInventory(prev => prev.map(item => {
-        if (selectedAlmacen === "Todos" || (item.almacen || "Sin Almacén") === selectedAlmacen) {
-           return { ...item, status: "missing" };
+  const toggleScan = async () => {
+    try {
+      if (!isScanning) {
+        if (filteredInventory.every(i => i.status === "found")) {
+          // Reiniciar si ya se encontró todo en el almacén actual
+          setInventory(prev => prev.map(item => {
+            if (selectedAlmacen === "Todos" || (item.almacen || "Sin Almacén") === selectedAlmacen) {
+               return { ...item, status: "missing" };
+            }
+            return item;
+          }));
+          setScanCount(0);
         }
-        return item;
-      }));
-      setScanCount(0);
+        await invoke("iniciar_lectura");
+      } else {
+        await invoke("detener_lectura");
+      }
+    } catch (error) {
+      alert("Error interactuando con el lector: " + error);
+      setIsScanning(false);
     }
-    setIsScanning(!isScanning);
   };
 
   const totalItems = filteredInventory.length;
