@@ -23,15 +23,11 @@ npm run tauri build
 cargo tauri android build
 
 
-## Flujo de Aplicativo v1
-Tag detectado por lector RFID
+## Flujo de Aplicativo v2
+Tag detectado
         ↓
-Rust procesa el frame (decodifica EPC)
+Guarda en SQLite (instantáneo)
         ↓
-Guarda en SQLite (sync)
+Emite evento al frontend INMEDIATAMENTE ← aquí debe ir
         ↓
-Intenta guardar en SQL Server (async - AQUÍ ESTÁ EL RETRASO)
-        ↓
-Emite evento al frontend "tag_leido"
-        ↓
-React recibe el evento y muestra el tag
+Intenta guardar en SQL Server en background (no bloquea)
