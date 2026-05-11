@@ -1,9 +1,7 @@
-
 import { useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 import Login from "./login";
-import RfidTest from "./RfidTest";
+import InventoryDashboard from "./InventoryDashboard";
 
 function App() {
   const [logged, setLogged] = useState(false);
@@ -12,7 +10,7 @@ function App() {
     return <Login onSuccess={() => setLogged(true)} />;
   }
 
-  return <RfidTest />;
+  return <InventoryDashboard />;
 }
 
 export default App;
