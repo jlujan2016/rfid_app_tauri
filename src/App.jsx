@@ -2,7 +2,7 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
-import Login from "./Login";
+import Login from "./login";
 import RfidTest from "./RfidTest";
 
 function App() {
