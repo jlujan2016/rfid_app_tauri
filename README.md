@@ -21,3 +21,13 @@ npm install
 npm run tauri build
 ### Android
 cargo tauri android build
+
+
+## Flujo de Aplicativo v2
+Tag detectado
+        ↓
+Guarda en SQLite (instantáneo)
+        ↓
+Emite evento al frontend INMEDIATAMENTE ← aquí debe ir
+        ↓
+Intenta guardar en SQL Server en background (no bloquea)
