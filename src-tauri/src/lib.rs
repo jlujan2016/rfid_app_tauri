@@ -1,7 +1,6 @@
 use rusqlite::{Connection, params};
-use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tiberius::{AuthMethod, Client, Config};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -9,22 +8,15 @@ use tokio::net::TcpStream;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 // ─── ESTADOS GLOBALES ─────────────────────────────────────────────────────────
-// DbState: contiene la conexión SQLite protegida por Mutex para acceso seguro entre threads
-// RfidState: bandera booleana para controlar si el loop de lectura está activo
 pub struct DbState(pub Mutex<Connection>);
-pub struct RfidState(pub Mutex<bool>); // true = leyendo, false = detenido
+pub struct RfidState(pub Mutex<bool>);
 
 // ─── HELPER MD5 ──────────────────────────────────────────────────────────────
-// Genera un hash MD5 en formato hexadecimal lowercase
-// Usado para hashear contraseñas al crear usuarios y al validar login
 fn hash_md5(input: &str) -> String {
     format!("{:x}", md5::compute(input))
 }
 
 // ─── CONSTRUCTOR DE COMANDOS RFID ─────────────────────────────────────────────
-// Construye el frame binario que entiende el lector UR4
-// Estructura: [0xA5][0x5A][LEN_HI][LEN_LO][CMD][DATA...][CHECKSUM][0x0D][0x0A]
-// El checksum es XOR de todos los bytes del header + data
 fn build_command(command: u8, data: &[u8]) -> Vec<u8> {
     let length = (8 + data.len()) as u16;
     let mut checksum: u8 = ((length >> 8) as u8) ^ (length as u8) ^ command;
@@ -32,45 +24,47 @@ fn build_command(command: u8, data: &[u8]) -> Vec<u8> {
         checksum ^= b;
     }
     let mut frame = Vec::new();
-    frame.push(0xA5);                    // byte de inicio 1
-    frame.push(0x5A);                    // byte de inicio 2
-    frame.push((length >> 8) as u8);     // longitud high byte
-    frame.push(length as u8);            // longitud low byte
-    frame.push(command);                 // comando
-    frame.extend_from_slice(data);       // datos del comando
-    frame.push(checksum);                // checksum XOR
-    frame.push(0x0D);                    // CR
-    frame.push(0x0A);                    // LF
+    frame.push(0xA5);
+    frame.push(0x5A);
+    frame.push((length >> 8) as u8);
+    frame.push(length as u8);
+    frame.push(command);
+    frame.extend_from_slice(data);
+    frame.push(checksum);
+    frame.push(0x0D);
+    frame.push(0x0A);
     frame
 }
 
 // ─── INICIALIZAR BASE DE DATOS ────────────────────────────────────────────────
-// Crea las tablas si no existen y genera el usuario admin por defecto
-// Se ejecuta una sola vez al arrancar la app
 fn init_db(conn: &Connection) {
     conn.execute_batch(
-        // Tabla users: idéntica a SQL Server para facilitar sincronización
-        // Tabla LecturasRFID: agrega columna 'sincronizado' para offline-first
-        //   sincronizado = 0 → pendiente de subir al servidor
-        //   sincronizado = 1 → ya fue enviado al servidor
-        "CREATE TABLE IF NOT EXISTS users (
+        "PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;
+         PRAGMA cache_size = 10000;
+         PRAGMA temp_store = MEMORY;
+         PRAGMA mmap_size = 268435456;
+         
+         CREATE TABLE IF NOT EXISTS users (
             id            INTEGER PRIMARY KEY,
             username      TEXT NOT NULL UNIQUE,
             password_hash TEXT NOT NULL,
             created_at    TEXT NOT NULL
-        );
+         );
 
-        CREATE TABLE IF NOT EXISTS LecturasRFID (
+         CREATE TABLE IF NOT EXISTS LecturasRFID (
             Id           INTEGER PRIMARY KEY AUTOINCREMENT,
             EPC          TEXT NOT NULL,
             FechaLectura TEXT NOT NULL DEFAULT (datetime('now')),
             sincronizado INTEGER NOT NULL DEFAULT 0
-        );",
+         );
+         
+         CREATE INDEX IF NOT EXISTS idx_epc ON LecturasRFID(EPC);
+         CREATE INDEX IF NOT EXISTS idx_fecha ON LecturasRFID(FechaLectura);
+         CREATE INDEX IF NOT EXISTS idx_sincronizado ON LecturasRFID(sincronizado);",
     )
     .expect("Error creando tablas");
 
-    // Crear usuario admin por defecto solo si no existe
-    // Contraseña: 1234 hasheada con MD5
     let count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM users WHERE username = 'admin'",
@@ -87,23 +81,19 @@ fn init_db(conn: &Connection) {
             params!["admin", password_hash],
         )
         .expect("Error insertando usuario admin");
-        println!("✅ Usuario admin creado con MD5");
+        println!("✅ Usuario admin creado");
     }
 }
 
 // ─── FETCH USUARIOS DEL SERVIDOR ─────────────────────────────────────────────
-// Conecta a SQL Server y trae todos los usuarios
-// Retorna None si no hay conexión (sin lanzar error)
-// Usado por login (sincronización automática) y por el comando sincronizar
 async fn fetch_users_from_server() -> Option<Vec<(String, String)>> {
     let mut config = Config::new();
     config.host("0_Ciberelectrik.mssql.somee.com");
     config.port(1433);
     config.database("0_Ciberelectrik");
     config.authentication(AuthMethod::sql_server("jlujan_SQLLogin_1", "yyeftklvtf"));
-    config.trust_cert(); // necesario para servidores sin certificado SSL válido
+    config.trust_cert();
 
-    // Si no hay conexión, retorna None silenciosamente
     let tcp = match TcpStream::connect(config.get_addr()).await {
         Ok(tcp) => tcp,
         Err(e) => {
@@ -152,8 +142,6 @@ async fn fetch_users_from_server() -> Option<Vec<(String, String)>> {
 }
 
 // ─── GUARDAR USUARIOS EN SQLITE ───────────────────────────────────────────────
-// Inserta o actualiza usuarios en SQLite local
-// ON CONFLICT actualiza el hash si el usuario ya existe (cambio de contraseña)
 fn save_users_to_sqlite(conn: &Connection, users: Vec<(String, String)>) -> usize {
     let mut count = 0;
     for (username, password_hash) in &users {
@@ -173,24 +161,25 @@ fn save_users_to_sqlite(conn: &Connection, users: Vec<(String, String)>) -> usiz
     count
 }
 
-// ─── GUARDAR EPC EN SQLITE ────────────────────────────────────────────────────
-// Guarda cada lectura RFID en SQLite con sincronizado=0 (pendiente)
-// Siempre guarda todas las lecturas con fecha para historial completo
-fn guardar_epc_sqlite(conn: &Connection, epc: &str) {
-    match conn.execute(
-        "INSERT INTO LecturasRFID (EPC, FechaLectura, sincronizado)
-         VALUES (?1, datetime('now'), 0)",
-        params![epc],
-    ) {
-        Ok(_) => println!("💾 SQLite INSERT OK: {}", epc),
-        Err(e) => println!("❌ SQLite ERROR: {}", e),
+// ─── GUARDAR BATCH DE EPCs EN SQLITE ──────────────────────────────────────────
+fn guardar_epcs_batch(conn: &mut Connection, epcs: &[String]) {
+    if epcs.is_empty() {
+        return;
     }
+    
+    let tx = conn.transaction().expect("Error iniciando transacción");
+    for epc in epcs {
+        tx.execute(
+            "INSERT INTO LecturasRFID (EPC, FechaLectura, sincronizado)
+             VALUES (?1, datetime('now'), 0)",
+            params![epc],
+        ).ok();
+    }
+    tx.commit().expect("Error commit transacción");
+    println!("💾 Batch SQLite: {} registros", epcs.len());
 }
 
 // ─── GUARDAR EPC EN SQL SERVER ────────────────────────────────────────────────
-// Intenta insertar el EPC en SQL Server
-// Si no hay conexión, el EPC ya quedó guardado en SQLite con sincronizado=0
-// El WHERE NOT EXISTS evita duplicados en el servidor
 async fn guardar_epc_server(epc: String) {
     let mut config = Config::new();
     config.host("0_Ciberelectrik.mssql.somee.com");
@@ -202,7 +191,7 @@ async fn guardar_epc_server(epc: String) {
     let tcp = match TcpStream::connect(config.get_addr()).await {
         Ok(tcp) => tcp,
         Err(_) => {
-            println!("⚠️ Sin conexión, EPC pendiente en SQLite: {}", epc);
+            println!("⚠️ Sin SQL Server: {}", epc);
             return;
         }
     };
@@ -210,7 +199,7 @@ async fn guardar_epc_server(epc: String) {
     let mut client = match Client::connect(config, tcp.compat_write()).await {
         Ok(c) => c,
         Err(e) => {
-            println!("⚠️ Error autenticando SQL Server: {}", e);
+            println!("⚠️ Error SQL Server: {}", e);
             return;
         }
     };
@@ -226,9 +215,7 @@ async fn guardar_epc_server(epc: String) {
     match client.execute(query, &[&epc.as_str()]).await {
         Ok(r) => {
             if r.total() > 0 {
-                println!("💾 SQL Server INSERT OK: {}", epc);
-            } else {
-                println!("⚠️ Duplicado en SQL Server: {}", epc);
+                println!("💾 SQL Server: {}", epc);
             }
         }
         Err(e) => println!("❌ SQL Server ERROR: {}", e),
@@ -236,31 +223,22 @@ async fn guardar_epc_server(epc: String) {
 }
 
 // ─── COMANDO SALUDAR ──────────────────────────────────────────────────────────
-// Comando de prueba para verificar comunicación Rust <-> React
 #[tauri::command]
 fn saludar(nombre: &str) -> String {
     format!("Hola {}", nombre)
 }
 
 // ─── COMANDO LOGIN ────────────────────────────────────────────────────────────
-// Flujo offline-first:
-// 1. Intenta sincronizar usuarios desde SQL Server (silencioso si falla)
-// 2. Valida siempre contra SQLite local (funciona sin red)
-// 3. Compara contraseña con hash MD5
 #[tauri::command]
 async fn login(state: State<'_, DbState>, user: String, pass: String) -> Result<bool, String> {
-    // Paso 1: fetch async sin tener el Mutex (evita error Send)
     let users_from_server = fetch_users_from_server().await;
-
-    // Paso 2: tomar el Mutex solo para operaciones sync
     let conn = state.0.lock().unwrap();
 
     if let Some(users) = users_from_server {
         let count = save_users_to_sqlite(&conn, users);
-        println!("✅ Sincronización automática: {} usuarios", count);
+        println!("✅ Sincronizados: {} usuarios", count);
     }
 
-    // Paso 3: validar con MD5 contra SQLite
     let result = conn.query_row(
         "SELECT password_hash FROM users WHERE username = ?1",
         params![user],
@@ -272,13 +250,11 @@ async fn login(state: State<'_, DbState>, user: String, pass: String) -> Result<
             let input_hash = hash_md5(&pass);
             Ok(input_hash == password_hash)
         }
-        Err(_) => Ok(false), // usuario no encontrado
+        Err(_) => Ok(false),
     }
 }
 
-// ─── COMANDO SINCRONIZAR MANUAL ───────────────────────────────────────────────
-// Fuerza sincronización de usuarios desde SQL Server
-// Útil también para subir lecturas RFID pendientes en el futuro
+// ─── COMANDO SINCRONIZAR ──────────────────────────────────────────────────────
 #[tauri::command]
 async fn sincronizar(state: State<'_, DbState>) -> Result<String, String> {
     let users = fetch_users_from_server()
@@ -288,157 +264,136 @@ async fn sincronizar(state: State<'_, DbState>) -> Result<String, String> {
     let conn = state.0.lock().unwrap();
     let count = save_users_to_sqlite(&conn, users);
 
-    Ok(format!("✅ {} usuarios sincronizados correctamente", count))
+    Ok(format!("✅ {} usuarios sincronizados", count))
 }
 
-// ─── COMANDO INICIAR LECTURA RFID ─────────────────────────────────────────────
-// Loop principal de lectura RFID:
-// 1. Conecta al lector por TCP (IP fija 192.168.1.180:8888)
-// 2. Envía comandos de configuración al UR4
-// 3. Lee frames binarios en loop
-// 4. Decodifica EPCs del frame 0x83 (inventory response)
-// 5. Aplica cache de 2 segundos para evitar lecturas duplicadas
-// 6. ORDEN CRÍTICO: SQLite → emitir evento → SQL Server en background
-//    Esto garantiza que el frontend se actualiza instantáneamente
+// ─── COMANDO INICIAR LECTURA RFID - ULTRA RÁPIDO ──────────────────────────────
+// ─── COMANDO INICIAR LECTURA RFID - ULTRA RÁPIDO (CONTADOR CORREGIDO) ─────────
 #[tauri::command]
 async fn iniciar_lectura(
     app: AppHandle,
     db_state: State<'_, DbState>,
     rfid_state: State<'_, RfidState>,
 ) -> Result<(), String> {
-    // Marcar lectura como activa
     *rfid_state.0.lock().unwrap() = true;
 
-    // Conectar al lector RFID por TCP
     let mut stream = TcpStream::connect("192.168.1.180:8888")
         .await
-        .map_err(|e| format!("Error conectando al lector RFID: {}", e))?;
-
+        .map_err(|e| format!("Error conectando: {}", e))?;
+    
+    stream.set_nodelay(true).map_err(|e| format!("Error set_nodelay: {}", e))?;
+    
     println!("✅ Conectado al lector RFID");
     app.emit("rfid_estado", "conectado").unwrap();
 
-    // Comando 0x60: configurar en modo lector
-    stream
-        .write_all(&build_command(0x60, &[0x01]))
-        .await
-        .map_err(|e| format!("Error enviando comando modo lector: {}", e))?;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Desactivar beeper
+    stream.write_all(&build_command(0xA0, &[0x00])).await.ok();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    
+    // Modo lector
+    stream.write_all(&build_command(0x60, &[0x01])).await
+        .map_err(|e| format!("Error modo lector: {}", e))?;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    
+    // Potencia máxima (1 metro)
+    stream.write_all(&build_command(0xB0, &[0x1F])).await.ok();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    
+    // Iniciar inventario continuo
+    stream.write_all(&build_command(0x82, &[0x00, 0x00])).await
+        .map_err(|e| format!("Error inventario: {}", e))?;
 
-    // Comando 0x82: iniciar inventario continuo
-    stream
-        .write_all(&build_command(0x82, &[0x00, 0x00]))
-        .await
-        .map_err(|e| format!("Error iniciando inventario: {}", e))?;
-
-    println!("📡 Inventario iniciado");
+    println!("📡 Inventario iniciado - ULTRA RÁPIDO");
 
     let mut buffer: Vec<u8> = Vec::new();
-    let mut temp = [0u8; 1024];
-    // Cache para evitar mostrar el mismo tag más de una vez cada 2 segundos
-    let mut cache: HashMap<String, Instant> = HashMap::new();
+    let mut temp = [0u8; 2048];
+    let mut batch_buffer: Vec<String> = Vec::with_capacity(30);
+    let mut ultimo_log = std::time::Instant::now();
+    let mut contador_por_segundo = 0;
+    let mut contador_total: u32 = 0;  // ← CONTADOR TOTAL CORREGIDO
+    let mut ultimo_flush = std::time::Instant::now();
 
     loop {
-        // Verificar si se solicitó detener antes de cada lectura
         if !*rfid_state.0.lock().unwrap() {
-            println!("🛑 Lectura RFID detenida");
+            if !batch_buffer.is_empty() {
+                let mut conn = db_state.0.lock().unwrap();
+                guardar_epcs_batch(&mut conn, &batch_buffer);
+            }
+            println!("🛑 Lectura detenida - Total: {} lecturas", contador_total);
             app.emit("rfid_estado", "detenido").unwrap();
             break;
         }
 
-        // Leer con timeout de 100ms para poder revisar el estado periódicamente
-        let n = match tokio::time::timeout(
-            Duration::from_millis(100),
-            stream.read(&mut temp),
-        )
-        .await
-        {
-            Ok(Ok(n)) => n,
-            Ok(Err(_)) => break,   // error de lectura, salir del loop
-            Err(_) => continue,    // timeout, volver a revisar estado
-        };
+        match stream.read(&mut temp).await {
+            Ok(n) if n > 0 => {
+                buffer.extend_from_slice(&temp[..n]);
 
-        if n == 0 {
-            continue;
-        }
+                let mut i = 0;
+                while i + 4 < buffer.len() {
+                    if buffer[i] == 0xA5 && buffer[i + 1] == 0x5A {
+                        let length = ((buffer[i + 2] as usize) << 8) | buffer[i + 3] as usize;
 
-        buffer.extend_from_slice(&temp[..n]);
+                        if i + length <= buffer.len() {
+                            let frame = &buffer[i..i + length];
 
-        let mut i = 0;
-        while i + 4 < buffer.len() {
-            // Buscar inicio de frame: 0xA5 0x5A
-            if buffer[i] != 0xA5 || buffer[i + 1] != 0x5A {
-                i += 1;
-                continue;
+                            if frame.len() > 6 && frame[4] == 0x83 {
+                                let payload = &frame[5..frame.len().saturating_sub(2)];
+                                
+                                for window in payload.windows(4) {
+                                    let candidate = hex::encode(window);
+                                    if candidate.starts_with("0041") || candidate.starts_with("0040") {
+                                        contador_por_segundo += 1;
+                                        contador_total += 1;  // ← INCREMENTAR CONTADOR TOTAL
+                                        
+                                        if ultimo_log.elapsed() >= Duration::from_secs(1) {
+                                            println!("⚡ {} lecturas/segundo", contador_por_segundo);
+                                            contador_por_segundo = 0;
+                                            ultimo_log = std::time::Instant::now();
+                                        }
+                                        
+                                        app.emit("tag_leido", &candidate).unwrap();
+                                        
+                                        batch_buffer.push(candidate);
+                                        
+                                        if batch_buffer.len() >= 30 || ultimo_flush.elapsed() >= Duration::from_secs(3) {
+                                            let mut conn = db_state.0.lock().unwrap();
+                                            guardar_epcs_batch(&mut conn, &batch_buffer);
+                                            batch_buffer.clear();
+                                            ultimo_flush = std::time::Instant::now();
+                                        }
+                                        
+                                        break;
+                                    }
+                                }
+                            }
+                            i += length;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+
+                if i > 0 {
+                    buffer.drain(0..i);
+                }
             }
-
-            let length = ((buffer[i + 2] as usize) << 8) | buffer[i + 3] as usize;
-
-            // Esperar hasta tener el frame completo
-            if i + length > buffer.len() {
+            Ok(_) => continue,
+            Err(e) => {
+                println!("Error de lectura: {}", e);
                 break;
             }
-
-            let frame = &buffer[i..i + length];
-
-            // Frame 0x83 = respuesta de inventario (contiene EPCs)
-            if frame.len() > 6 && frame[4] == 0x83 {
-                let payload = &frame[5..frame.len().saturating_sub(2)];
-                let mut found = String::new();
-
-                // Buscar EPC válido en el payload usando ventana de 4 bytes
-                // Heurística: EPCs del lector UR4 comienzan con 0041 o 0040
-                for window in payload.windows(4) {
-                    let candidate = hex::encode(window);
-                    if candidate.starts_with("0041") || candidate.starts_with("0040") {
-                        found = candidate;
-                        break;
-                    }
-                }
-
-                if !found.is_empty() {
-                    let now = Instant::now();
-
-                    // Filtro de duplicados: ignorar si el mismo tag fue leído hace menos de 2s
-                    if let Some(last) = cache.get(&found) {
-                        if now.duration_since(*last) < Duration::from_secs(2) {
-                            i += length;
-                            continue;
-                        }
-                    }
-                    cache.insert(found.clone(), now);
-
-                    println!("📦 TAG: {}", found);
-
-                    // ─── ORDEN CRÍTICO PARA SINCRONÍA ────────────────────────
-                    // 1. Guardar en SQLite primero (instantáneo, offline-first)
-                    {
-                        let conn = db_state.0.lock().unwrap();
-                        guardar_epc_sqlite(&conn, &found);
-                    }
-
-                    // 2. Emitir al frontend INMEDIATAMENTE (sin esperar el server)
-                    //    Esto garantiza que el tag aparece en pantalla al instante
-                    app.emit("tag_leido", &found).unwrap();
-
-                    // 3. Guardar en SQL Server en background (no bloquea el loop)
-                    //    Si falla, el EPC queda en SQLite con sincronizado=0
-                    tokio::spawn(guardar_epc_server(found.clone()));
-                }
-            }
-
-            i += length;
         }
-
-        // Limpiar bytes ya procesados del buffer
-        buffer.drain(0..i);
+        
+        tokio::task::yield_now().await;
     }
 
     Ok(())
 }
 
-// ─── COMANDO DETENER LECTURA RFID ─────────────────────────────────────────────
-// Pone la bandera RfidState en false
-// El loop en iniciar_lectura detecta el cambio en el siguiente ciclo (max 100ms)
+
+// ─── COMANDO DETENER LECTURA ──────────────────────────────────────────────────
 #[tauri::command]
 fn detener_lectura(rfid_state: State<'_, RfidState>) {
     *rfid_state.0.lock().unwrap() = false;
@@ -446,16 +401,11 @@ fn detener_lectura(rfid_state: State<'_, RfidState>) {
 }
 
 // ─── ENTRY POINT ─────────────────────────────────────────────────────────────
-// Punto de entrada de la app para desktop y mobile
-// Inicializa la BD, registra los estados globales y los comandos disponibles
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            // Ruta de la BD adaptada automáticamente por plataforma:
-            // Desktop  → AppData\Roaming\com.lujan.rfid-app-tauri\app.db
-            // Android  → /data/data/com.lujan.rfid_app_tauri/app.db
             let db_path = app
                 .path()
                 .app_data_dir()
@@ -464,14 +414,12 @@ pub fn run() {
 
             println!("📂 Base de datos en: {:?}", db_path);
 
-            // Crear directorio si no existe
             std::fs::create_dir_all(db_path.parent().unwrap())
-                .expect("Error creando directorio de la BD");
+                .expect("Error creando directorio");
 
             let conn = Connection::open(&db_path).expect("Error abriendo SQLite");
             init_db(&conn);
 
-            // Registrar estados globales accesibles desde cualquier comando
             app.manage(DbState(Mutex::new(conn)));
             app.manage(RfidState(Mutex::new(false)));
 

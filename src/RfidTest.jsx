@@ -2,40 +2,94 @@ import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
+// Sonido rápido sin delay
+const playBeep = () => {
+    try {
+        const AudioContext = window.AudioContext || window.webkitAudioContext;
+        const audioContext = new AudioContext();
+        const oscillator = audioContext.createOscillator();
+        const gainNode = audioContext.createGain();
+        
+        oscillator.connect(gainNode);
+        gainNode.connect(audioContext.destination);
+        
+        oscillator.frequency.value = 2400;
+        gainNode.gain.value = 0.15;
+        
+        oscillator.start();
+        gainNode.gain.exponentialRampToValueAtTime(0.00001, audioContext.currentTime + 0.1);
+        oscillator.stop(audioContext.currentTime + 0.1);
+        
+        audioContext.resume();
+    } catch (e) {
+        // Silencio si no hay audio
+    }
+};
+
 function RfidTest() {
   const [leyendo, setLeyendo] = useState(false);
   const [estado, setEstado] = useState("desconectado");
-  const [tags, setTags] = useState([]);
-  const [sincMensaje, setSincMensaje] = useState("");
-  const [sincronizando, setSincronizando] = useState(false);
-  const unlistenRef = useRef([]);
+  const [tags, setTags] = useState({});
+  const [ultimoTag, setUltimoTag] = useState(null);
+  const [lecturasPorSegundo, setLecturasPorSegundo] = useState(0);
+  
+  const contadorSegundo = useRef(0);
+  const lastTime = useRef(Date.now());
+  const updatePending = useRef(false);
+  const pendingUpdates = useRef({});
+
+  // 🔥 ACTUALIZACIÓN INMEDIATA (sin throttle)
+  const actualizarTag = (epc) => {
+    const ahora = Date.now();
+    
+    // Contar lecturas/segundo
+    contadorSegundo.current++;
+    if (ahora - lastTime.current >= 1000) {
+      setLecturasPorSegundo(contadorSegundo.current);
+      contadorSegundo.current = 0;
+      lastTime.current = ahora;
+    }
+    
+    // Actualización DIRECTA del estado
+    setTags(prev => {
+      const newCount = (prev[epc]?.count || 0) + 1;
+      return {
+        ...prev,
+        [epc]: {
+          epc: epc,
+          count: newCount,
+          lastSeen: new Date().toLocaleTimeString(),
+        },
+      };
+    });
+    
+    setUltimoTag({ epc, timestamp: ahora });
+    playBeep();
+  };
 
   useEffect(() => {
-    // Escuchar tags leídos en tiempo real
-    const unlistenTag = listen("tag_leido", (event) => {
-      const epc = event.payload;
-      const fecha = new Date().toLocaleTimeString();
-      setTags((prev) => [{ epc, fecha }, ...prev]);
+    // Listener SIN ningún throttle
+    const unlisten = listen("tag_leido", (event) => {
+      actualizarTag(event.payload);
     });
 
-    // Escuchar estado del lector
     const unlistenEstado = listen("rfid_estado", (event) => {
       setEstado(event.payload);
-      if (event.payload === "detenido") {
-        setLeyendo(false);
-      }
+      if (event.payload === "conectado") setLeyendo(true);
+      if (event.payload === "detenido") setLeyendo(false);
     });
 
-    unlistenRef.current = [unlistenTag, unlistenEstado];
-
     return () => {
-      unlistenRef.current.forEach((fn) => fn.then((f) => f()));
+      unlisten.then(fn => fn());
+      unlistenEstado.then(fn => fn());
     };
   }, []);
 
   async function iniciarLectura() {
     setLeyendo(true);
-    setTags([]);
+    setTags({});
+    setUltimoTag(null);
+    contadorSegundo.current = 0;
     try {
       await invoke("iniciar_lectura");
     } catch (error) {
@@ -49,186 +103,66 @@ function RfidTest() {
     setLeyendo(false);
   }
 
-  async function sincronizar() {
-    setSincronizando(true);
-    setSincMensaje("Sincronizando...");
-    try {
-      const resultado = await invoke("sincronizar");
-      setSincMensaje(resultado);
-    } catch (error) {
-      setSincMensaje("❌ Error: " + error);
-    } finally {
-      setSincronizando(false);
-    }
-  }
-
-  const estadoColor = {
-    conectado: "#6bff8e",
-    detenido: "#aaa",
-    desconectado: "#aaa",
-  }[estado] || "#ff6b6b";
+  const tagList = Object.values(tags).sort((a, b) => a.epc.localeCompare(b.epc));
+  const totalLecturas = tagList.reduce((sum, t) => sum + t.count, 0);
 
   return (
     <div style={styles.container}>
-
-      {/* HEADER */}
       <div style={styles.header}>
-        <h2 style={styles.title}>📡 Panel RFID</h2>
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <div style={{ ...styles.dot, background: estadoColor }} />
-          <span style={{ color: estadoColor, fontSize: 12 }}>{estado}</span>
+        <h2 style={styles.title}>📡 RFID - ULTRA RÁPIDO</h2>
+        <div style={{ display: "flex", gap: 10 }}>
+          {lecturasPorSegundo > 0 && (
+            <span style={{ color: "#ffaa44" }}>⚡ {lecturasPorSegundo}/seg</span>
+          )}
+          <div style={{ width: 10, height: 10, borderRadius: "50%", background: estado === "conectado" ? "#6bff8e" : "#aaa" }} />
+          <span>{estado}</span>
         </div>
       </div>
 
-      {/* BOTONES LECTURA */}
+      {ultimoTag && (
+        <div style={styles.ultimoTag}>
+          🏷️ {ultimoTag.epc}
+        </div>
+      )}
+
       <div style={styles.row}>
-        <button
-          onClick={iniciarLectura}
-          disabled={leyendo}
-          style={{ ...styles.btn, background: leyendo ? "#555" : "red" }}
-        >
-          {leyendo ? "⏳ Leyendo..." : "▶ Iniciar lectura"}
+        <button onClick={iniciarLectura} disabled={leyendo} style={styles.btnGreen}>
+          {leyendo ? "LEYENDO..." : "▶ INICIAR"}
         </button>
-
-        <button
-          onClick={detenerLectura}
-          disabled={!leyendo}
-          style={{ ...styles.btn, background: !leyendo ? "#555" : "#c0392b" }}
-        >
-          ⏹ Detener
+        <button onClick={detenerLectura} disabled={!leyendo} style={styles.btnRed}>
+          ⏹ DETENER
         </button>
       </div>
 
-      {/* CONTADOR */}
-      {tags.length > 0 && (
-        <p style={styles.counter}>
-          {tags.length} tag{tags.length !== 1 ? "s" : ""} leído{tags.length !== 1 ? "s" : ""}
-        </p>
-      )}
-
-      {/* LISTA DE TAGS */}
-      <div style={styles.tagList}>
-        {tags.length === 0 ? (
-          <p style={styles.empty}>
-            {leyendo ? "Esperando tags..." : "Sin lecturas aún"}
-          </p>
-        ) : (
-          tags.map((tag, i) => (
-            <div key={i} style={styles.tagItem}>
-              <span style={styles.tagEpc}>📦 {tag.epc}</span>
-              <span style={styles.tagFecha}>{tag.fecha}</span>
-            </div>
-          ))
-        )}
+      <div style={styles.stats}>
+        <div>📊 Total lecturas: <strong>{totalLecturas}</strong></div>
+        <div>🏷️ Tags únicos: <strong>{tagList.length}</strong></div>
       </div>
 
-      {/* SEPARADOR */}
-      <hr style={styles.hr} />
-
-      {/* BOTÓN SINCRONIZAR */}
-      <button
-        onClick={sincronizar}
-        disabled={sincronizando}
-        style={{ ...styles.btn, background: sincronizando ? "#555" : "#c0392b" }}
-      >
-        {sincronizando ? "Sincronizando..." : "🔄 Sincronizar con servidor"}
-      </button>
-
-      {sincMensaje && (
-        <p style={{
-          ...styles.mensaje,
-          color: sincMensaje.startsWith("❌") ? "#ff6b6b" : "#6bff8e",
-        }}>
-          {sincMensaje}
-        </p>
-      )}
-
+      <div style={styles.table}>
+        {tagList.slice(0, 20).map((tag, idx) => (
+          <div key={tag.epc} style={styles.rowTable}>
+            <span style={{ width: 40 }}>{idx + 1}</span>
+            <span style={{ flex: 1, color: "#6bff8e" }}>{tag.epc}</span>
+            <span style={{ width: 80, color: "#e74c3c", fontWeight: "bold" }}>{tag.count}</span>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
 
 const styles = {
-  container: {
-    padding: 20,
-    fontFamily: "monospace",
-    background: "#0a0a0a",
-    minHeight: "100vh",
-    color: "white",
-  },
-  header: {
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-    marginBottom: 16,
-  },
-  title: {
-    color: "red",
-    margin: 0,
-    fontSize: 18,
-  },
-  dot: {
-    width: 10,
-    height: 10,
-    borderRadius: "50%",
-  },
-  row: {
-    display: "flex",
-    gap: 10,
-    marginBottom: 12,
-  },
-  btn: {
-    flex: 1,
-    padding: "10px 16px",
-    border: "none",
-    color: "white",
-    cursor: "pointer",
-    fontWeight: "bold",
-    fontFamily: "monospace",
-    fontSize: 13,
-  },
-  counter: {
-    color: "#aaa",
-    fontSize: 12,
-    margin: "4px 0 8px",
-  },
-  tagList: {
-    border: "1px solid #222",
-    minHeight: 200,
-    maxHeight: 350,
-    overflowY: "auto",
-    padding: 10,
-    marginBottom: 16,
-  },
-  tagItem: {
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-    padding: "6px 0",
-    borderBottom: "1px solid #1a1a1a",
-  },
-  tagEpc: {
-    color: "#6bff8e",
-    fontSize: 13,
-  },
-  tagFecha: {
-    color: "#555",
-    fontSize: 11,
-  },
-  empty: {
-    color: "#444",
-    textAlign: "center",
-    marginTop: 60,
-  },
-  hr: {
-    borderColor: "#222",
-    margin: "16px 0",
-  },
-  mensaje: {
-    marginTop: 8,
-    padding: 10,
-    border: "1px solid #333",
-    fontSize: 13,
-  },
+  container: { padding: 20, background: "#0a0a0a", minHeight: "100vh", color: "white", fontFamily: "monospace" },
+  header: { display: "flex", justifyContent: "space-between", marginBottom: 16 },
+  title: { color: "#e74c3c", margin: 0 },
+  ultimoTag: { background: "#1a1a1a", padding: 10, borderRadius: 4, marginBottom: 12, textAlign: "center" },
+  row: { display: "flex", gap: 10, marginBottom: 12 },
+  btnGreen: { flex: 1, padding: 12, background: "#e74c3c", border: "none", color: "white", fontWeight: "bold", cursor: "pointer" },
+  btnRed: { flex: 1, padding: 12, background: "#c0392b", border: "none", color: "white", fontWeight: "bold", cursor: "pointer" },
+  stats: { display: "flex", gap: 20, marginBottom: 12, padding: 10, background: "#111", borderRadius: 4 },
+  table: { background: "#111", borderRadius: 4, maxHeight: 400, overflow: "auto" },
+  rowTable: { display: "flex", padding: 8, borderBottom: "1px solid #222" },
 };
 
 export default RfidTest;
