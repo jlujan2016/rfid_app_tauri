@@ -94,12 +94,23 @@ function Login({ onSuccess }) {
   }, []);
 
   async function handleLogin() {
-    const ok = await invoke("login", { user, pass });
+    try {
+      const ok = await invoke("login", { user, pass });
 
-    if (ok) {
-      onSuccess();
-    } else {
-      alert("Credenciales incorrectas");
+      if (ok) {
+        onSuccess();
+      } else {
+        alert("Credenciales incorrectas");
+      }
+    } catch (error) {
+      console.warn("Tauri invoke error:", error);
+      // Permitir bypass en el navegador para pruebas
+      if (!window.__TAURI_IPC__) {
+        console.log("Modo navegador detectado. Omitiendo login.");
+        onSuccess();
+      } else {
+        alert("Error de conexión con el backend: " + error);
+      }
     }
   }
 
