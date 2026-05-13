@@ -344,7 +344,8 @@ async fn iniciar_lectura(
                                     if candidate.starts_with("0041") || candidate.starts_with("0040") {
                                         contador_por_segundo += 1;
                                         contador_total += 1;  // ← INCREMENTAR CONTADOR TOTAL
-                                        
+                                        // 🔥 AQUÍ VA EL EMIT DEL CONTADOR TOTAL (OPCIONAL)
+                                        app.emit("contador_total", &contador_total).unwrap();
                                         if ultimo_log.elapsed() >= Duration::from_secs(1) {
                                             println!("⚡ {} lecturas/segundo", contador_por_segundo);
                                             contador_por_segundo = 0;
