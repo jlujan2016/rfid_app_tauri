@@ -39,19 +39,33 @@ cargo tauri android build
 
 ## 📁 Estructura del Proyecto
 rfid-app-tauri/
+
 │
+
 ├── rfid-app.keystore ← Keystore (en la raíz)
+
 │
+
 ├── src-tauri/
+
 │ ├── gen/
+
 │ │ └── android/
+
 │ │ ├── keystore.properties ← Configuración de firma
+
 │ │ │
+
 │ │ └── app/
+
 │ │ └── build.gradle.kts ← Configuración Gradle (modificada)
+
 │ │
+
 │ └── tauri.conf.json
+
 │
+
 └── README.md
 
 
