@@ -222,6 +222,150 @@ async fn guardar_epc_server(epc: String) {
     }
 }
 
+// ─── SINCRONIZAR EPCs PENDIENTES CON SQL SERVER (BACKGROUND) ─────────────────
+async fn sincronizar_rfid_pendiente(db_state: tauri::State<'_, DbState>) {
+    use tokio::time;
+    let mut interval = time::interval(Duration::from_secs(30)); // Cada 30 segundos
+    
+    loop {
+        interval.tick().await;
+        
+        // Obtener EPCs no sincronizados (sincronizado = 0)
+        let epcs_pendientes: Vec<String> = {
+            let conn = db_state.0.lock().unwrap();
+            
+            // Preparar la consulta
+            let mut stmt = match conn.prepare(
+                "SELECT EPC FROM LecturasRFID 
+                 WHERE sincronizado = 0 
+                 ORDER BY Id ASC
+                 LIMIT 50"
+            ) {
+                Ok(stmt) => stmt,
+                Err(e) => {
+                    println!("⚠️ Error preparando consulta: {}", e);
+                    continue;
+                }
+            };
+            
+            // Ejecutar la consulta y recolectar resultados
+            let epcs: Vec<String> = match stmt.query_map([], |row| row.get(0)) {
+                Ok(rows) => {
+                    let mut result = Vec::new();
+                    for row in rows {
+                        if let Ok(epc) = row {
+                            result.push(epc);
+                        }
+                    }
+                    result
+                }
+                Err(e) => {
+                    println!("⚠️ Error consultando EPCs pendientes: {}", e);
+                    continue;
+                }
+            };
+            
+            epcs
+        };
+        
+        if !epcs_pendientes.is_empty() {
+            println!("🔄 Sincronizando {} EPCs con SQL Server...", epcs_pendientes.len());
+            
+            let mut sincronizados = 0;
+            for epc in epcs_pendientes {
+                // Enviar a SQL Server
+                guardar_epc_server(epc.clone()).await;
+                
+                // Marcar como sincronizado en SQLite
+                let conn = db_state.0.lock().unwrap();
+                if let Err(e) = conn.execute(
+                    "UPDATE LecturasRFID SET sincronizado = 1 WHERE EPC = ?1",
+                    params![epc]
+                ) {
+                    println!("⚠️ Error marcando EPC {} como sincronizado: {}", epc, e);
+                } else {
+                    sincronizados += 1;
+                }
+            }
+            
+            println!("✅ {} EPCs sincronizados con SQL Server", sincronizados);
+        }
+    }
+}
+
+
+// ─── COMANDO SINCRONIZAR RFID MANUAL ──────────────────────────────────────────
+#[tauri::command]
+async fn sincronizar_rfid_manual(db_state: State<'_, DbState>) -> Result<String, String> {
+    // Obtener EPCs no sincronizados
+    let epcs_pendientes: Vec<String> = {
+        let conn = db_state.0.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT EPC FROM LecturasRFID 
+             WHERE sincronizado = 0 
+             ORDER BY Id ASC
+             LIMIT 100"
+        ).map_err(|e| format!("Error preparando consulta: {}", e))?;
+        
+        let rows = stmt.query_map([], |row| row.get(0))
+            .map_err(|e| format!("Error consultando: {}", e))?;
+        
+        let mut result = Vec::new();
+        for row in rows {
+            if let Ok(epc) = row {
+                result.push(epc);
+            }
+        }
+        result
+    };
+    
+    if epcs_pendientes.is_empty() {
+        return Ok("📭 No hay datos pendientes por sincronizar".to_string());
+    }
+    
+    println!("🔄 Sincronizando manualmente {} EPCs...", epcs_pendientes.len());
+    
+    let mut sincronizados = 0;
+    for epc in epcs_pendientes {
+        guardar_epc_server(epc.clone()).await;
+        
+        let conn = db_state.0.lock().unwrap();
+        conn.execute(
+            "UPDATE LecturasRFID SET sincronizado = 1 WHERE EPC = ?1",
+            params![epc]
+        ).map_err(|e| format!("Error actualizando: {}", e))?;
+        
+        sincronizados += 1;
+    }
+    
+    Ok(format!("✅ {} EPCs sincronizados con SQL Server", sincronizados))
+}
+// ─── EXTRAER EPC UNIVERSAL (COMO EL PRIMER PROYECTO) ─────────────────────────
+fn extraer_epc_universal(payload: &[u8]) -> Option<String> {
+    // Método exactamente como el primer proyecto
+    if payload.len() < 6 {
+        return None;
+    }
+    
+    // El EPC siempre empieza en byte[2]
+    // Los ultimos 4 bytes siempre son RSSI/metadata → los ignoramos
+    let epc_start = 2;
+    let epc_end = payload.len() - 4;
+    
+    if epc_start >= epc_end {
+        return None;
+    }
+    
+    let epc = hex::encode(&payload[epc_start..epc_end]);
+    
+    // Validar que no sea vacío
+    if epc.is_empty() {
+        None
+    } else {
+        Some(epc)
+    }
+}
+
 // ─── COMANDO SALUDAR ──────────────────────────────────────────────────────────
 #[tauri::command]
 fn saludar(nombre: &str) -> String {
@@ -312,7 +456,8 @@ async fn iniciar_lectura(
     let mut contador_por_segundo = 0;
     let mut contador_total: u32 = 0;  // ← CONTADOR TOTAL CORREGIDO
     let mut ultimo_flush = std::time::Instant::now();
-
+     // Cache para evitar duplicados (como en el primer proyecto)
+    let mut cache: std::collections::HashMap<String, std::time::Instant> = std::collections::HashMap::new();
     loop {
         if !*rfid_state.0.lock().unwrap() {
             if !batch_buffer.is_empty() {
@@ -322,6 +467,11 @@ async fn iniciar_lectura(
             println!("🛑 Lectura detenida - Total: {} lecturas", contador_total);
             app.emit("rfid_estado", "detenido").unwrap();
             break;
+        }
+
+                // Limpiar cache cada minuto
+        if ultimo_log.elapsed() >= Duration::from_secs(60) {
+            cache.retain(|_, timestamp| timestamp.elapsed() < Duration::from_secs(2));
         }
 
         match stream.read(&mut temp).await {
@@ -339,31 +489,47 @@ async fn iniciar_lectura(
                             if frame.len() > 6 && frame[4] == 0x83 {
                                 let payload = &frame[5..frame.len().saturating_sub(2)];
                                 
-                                for window in payload.windows(4) {
-                                    let candidate = hex::encode(window);
-                                    if candidate.starts_with("0041") || candidate.starts_with("0040") {
-                                        contador_por_segundo += 1;
-                                        contador_total += 1;  // ← INCREMENTAR CONTADOR TOTAL
-                                        // 🔥 AQUÍ VA EL EMIT DEL CONTADOR TOTAL (OPCIONAL)
-                                        app.emit("contador_total", &contador_total).unwrap();
-                                        if ultimo_log.elapsed() >= Duration::from_secs(1) {
-                                            println!("⚡ {} lecturas/segundo", contador_por_segundo);
-                                            contador_por_segundo = 0;
-                                            ultimo_log = std::time::Instant::now();
+                                // USAR EL EXTRACTOR UNIVERSAL
+                                if let Some(epc) = extraer_epc_universal(payload) {
+                                    let now = std::time::Instant::now();
+                                    
+                                    // Verificar si ya vimos este EPC recientemente (menos de 2 segundos)
+                                    if let Some(last_time) = cache.get(&epc) {
+                                        if now.duration_since(*last_time) < Duration::from_secs(2) {
+                                            continue; // Ignorar duplicado
                                         }
-                                        
-                                        app.emit("tag_leido", &candidate).unwrap();
-                                        
-                                        batch_buffer.push(candidate);
-                                        
-                                        if batch_buffer.len() >= 30 || ultimo_flush.elapsed() >= Duration::from_secs(3) {
-                                            let mut conn = db_state.0.lock().unwrap();
-                                            guardar_epcs_batch(&mut conn, &batch_buffer);
-                                            batch_buffer.clear();
-                                            ultimo_flush = std::time::Instant::now();
-                                        }
-                                        
-                                        break;
+                                    }
+                                    
+                                    // Insertar en cache
+                                    cache.insert(epc.clone(), now);
+                                    
+                                    // Contar estadísticas
+                                    contador_por_segundo += 1;
+                                    contador_total += 1;
+                                    
+                                    // Mostrar tasa de lectura cada segundo
+                                    if ultimo_log.elapsed() >= Duration::from_secs(1) {
+                                        println!("⚡ {} lecturas/segundo (total únicas: {})", 
+                                            contador_por_segundo, contador_total);
+                                        app.emit("lecturas_por_segundo", contador_por_segundo).unwrap();
+                                        contador_por_segundo = 0;
+                                        ultimo_log = std::time::Instant::now();
+                                    }
+                                    
+                                    // Emitir evento al frontend
+                                    app.emit("tag_leido", &epc).unwrap();
+                                    app.emit("contador_total", &contador_total).unwrap();
+                                    
+                                    // Acumular para batch
+                                    batch_buffer.push(epc);
+                                    
+                                    // Guardar batch cuando alcanza 30 o pasaron 3 segundos
+                                    if batch_buffer.len() >= 30 || ultimo_flush.elapsed() >= Duration::from_secs(3) {
+                                        let mut conn = db_state.0.lock().unwrap();
+                                        guardar_epcs_batch(&mut conn, &batch_buffer);
+                                        println!("💾 Guardados {} EPCs en SQLite", batch_buffer.len());
+                                        batch_buffer.clear();
+                                        ultimo_flush = std::time::Instant::now();
                                     }
                                 }
                             }
@@ -393,7 +559,6 @@ async fn iniciar_lectura(
     Ok(())
 }
 
-
 // ─── COMANDO DETENER LECTURA ──────────────────────────────────────────────────
 #[tauri::command]
 fn detener_lectura(rfid_state: State<'_, RfidState>) {
@@ -421,8 +586,17 @@ pub fn run() {
             let conn = Connection::open(&db_path).expect("Error abriendo SQLite");
             init_db(&conn);
 
-            app.manage(DbState(Mutex::new(conn)));
+            let db_state = DbState(Mutex::new(conn));
+            app.manage(db_state);
             app.manage(RfidState(Mutex::new(false)));
+
+            // 🔥 INICIAR TAREA DE SINCRONIZACIÓN EN BACKGROUND
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let db_state = app_handle.state::<DbState>();
+                sincronizar_rfid_pendiente(db_state).await;
+            });
 
             Ok(())
         })
@@ -430,6 +604,7 @@ pub fn run() {
             saludar,
             login,
             sincronizar,
+            sincronizar_rfid_manual,
             iniciar_lectura,
             detener_lectura
         ])
