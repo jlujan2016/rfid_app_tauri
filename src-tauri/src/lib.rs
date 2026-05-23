@@ -55,6 +55,7 @@ fn init_db(conn: &Connection) {
          CREATE TABLE IF NOT EXISTS LecturasRFID (
             Id           INTEGER PRIMARY KEY AUTOINCREMENT,
             EPC          TEXT NOT NULL,
+            Antena       INTEGER, 
             FechaLectura TEXT NOT NULL DEFAULT (datetime('now')),
             sincronizado INTEGER NOT NULL DEFAULT 0
          );
@@ -162,17 +163,17 @@ fn save_users_to_sqlite(conn: &Connection, users: Vec<(String, String)>) -> usiz
 }
 
 // ─── GUARDAR BATCH DE EPCs EN SQLITE ──────────────────────────────────────────
-fn guardar_epcs_batch(conn: &mut Connection, epcs: &[String]) {
+fn guardar_epcs_batch(conn: &mut Connection, epcs: &[(String, u8)]) {
     if epcs.is_empty() {
         return;
     }
     
     let tx = conn.transaction().expect("Error iniciando transacción");
-    for epc in epcs {
+    for (epc, antena) in epcs {
         tx.execute(
-            "INSERT INTO LecturasRFID (EPC, FechaLectura, sincronizado)
-             VALUES (?1, datetime('now'), 0)",
-            params![epc],
+            "INSERT INTO LecturasRFID (EPC, Antena, FechaLectura, sincronizado)
+             VALUES (?1, ?2, datetime('now'), 0)",
+            params![epc, *antena as i32],
         ).ok();
     }
     tx.commit().expect("Error commit transacción");
@@ -180,7 +181,7 @@ fn guardar_epcs_batch(conn: &mut Connection, epcs: &[String]) {
 }
 
 // ─── GUARDAR EPC EN SQL SERVER ────────────────────────────────────────────────
-async fn guardar_epc_server(epc: String) {
+async fn guardar_epc_server(epc: String, antena: u8) {
     let mut config = Config::new();
     config.host("0_Ciberelectrik.mssql.somee.com");
     config.port(1433);
@@ -205,17 +206,18 @@ async fn guardar_epc_server(epc: String) {
     };
 
     let query = "
-        INSERT INTO LecturasRFID (EPC)
-        SELECT @P1
+        INSERT INTO LecturasRFID (EPC, Antena)
+        SELECT @P1, @P2
         WHERE NOT EXISTS (
             SELECT 1 FROM LecturasRFID WHERE EPC = @P1
         )
     ";
 
-    match client.execute(query, &[&epc.as_str()]).await {
+    let antena_i32 = antena as i32;
+    match client.execute(query, &[&epc.as_str(), &antena_i32]).await {
         Ok(r) => {
             if r.total() > 0 {
-                println!("💾 SQL Server: {}", epc);
+                println!("💾 SQL Server: {}  antena: {}", epc, antena);
             }
         }
         Err(e) => println!("❌ SQL Server ERROR: {}", e),
@@ -231,12 +233,11 @@ async fn sincronizar_rfid_pendiente(db_state: tauri::State<'_, DbState>) {
         interval.tick().await;
         
         // Obtener EPCs no sincronizados (sincronizado = 0)
-        let epcs_pendientes: Vec<String> = {
+        let epcs_pendientes: Vec<(String, u8)> = {
             let conn = db_state.0.lock().unwrap();
-            
             // Preparar la consulta
             let mut stmt = match conn.prepare(
-                "SELECT EPC FROM LecturasRFID 
+                "SELECT EPC, Antena FROM LecturasRFID 
                  WHERE sincronizado = 0 
                  ORDER BY Id ASC
                  LIMIT 50"
@@ -247,14 +248,17 @@ async fn sincronizar_rfid_pendiente(db_state: tauri::State<'_, DbState>) {
                     continue;
                 }
             };
-            
             // Ejecutar la consulta y recolectar resultados
-            let epcs: Vec<String> = match stmt.query_map([], |row| row.get(0)) {
+            let epcs: Vec<(String, u8)> = match stmt.query_map([], |row| {
+                let epc: String = row.get(0)?;
+                let antena: i32 = row.get(1).unwrap_or(1);
+                Ok((epc, antena as u8))
+            }) {
                 Ok(rows) => {
                     let mut result = Vec::new();
                     for row in rows {
-                        if let Ok(epc) = row {
-                            result.push(epc);
+                        if let Ok(par) = row {
+                            result.push(par);
                         }
                     }
                     result
@@ -272,9 +276,9 @@ async fn sincronizar_rfid_pendiente(db_state: tauri::State<'_, DbState>) {
             println!("🔄 Sincronizando {} EPCs con SQL Server...", epcs_pendientes.len());
             
             let mut sincronizados = 0;
-            for epc in epcs_pendientes {
-                // Enviar a SQL Server
-                guardar_epc_server(epc.clone()).await;
+            for (epc, antena) in epcs_pendientes {
+                // Enviar a SQL Server con antena
+                guardar_epc_server(epc.clone(), antena).await;
                 
                 // Marcar como sincronizado en SQLite
                 let conn = db_state.0.lock().unwrap();
@@ -298,22 +302,25 @@ async fn sincronizar_rfid_pendiente(db_state: tauri::State<'_, DbState>) {
 #[tauri::command]
 async fn sincronizar_rfid_manual(db_state: State<'_, DbState>) -> Result<String, String> {
     // Obtener EPCs no sincronizados
-    let epcs_pendientes: Vec<String> = {
+    let epcs_pendientes: Vec<(String, u8)> = {
         let conn = db_state.0.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT EPC FROM LecturasRFID 
+            "SELECT EPC, Antena FROM LecturasRFID 
              WHERE sincronizado = 0 
              ORDER BY Id ASC
              LIMIT 100"
         ).map_err(|e| format!("Error preparando consulta: {}", e))?;
         
-        let rows = stmt.query_map([], |row| row.get(0))
-            .map_err(|e| format!("Error consultando: {}", e))?;
+        let rows = stmt.query_map([], |row| {
+            let epc: String = row.get(0)?;
+            let antena: i32 = row.get(1).unwrap_or(1);
+            Ok((epc, antena as u8))
+        }).map_err(|e| format!("Error consultando: {}", e))?;
         
         let mut result = Vec::new();
         for row in rows {
-            if let Ok(epc) = row {
-                result.push(epc);
+            if let Ok(par) = row {
+                result.push(par);
             }
         }
         result
@@ -326,8 +333,8 @@ async fn sincronizar_rfid_manual(db_state: State<'_, DbState>) -> Result<String,
     println!("🔄 Sincronizando manualmente {} EPCs...", epcs_pendientes.len());
     
     let mut sincronizados = 0;
-    for epc in epcs_pendientes {
-        guardar_epc_server(epc.clone()).await;
+    for (epc, antena) in epcs_pendientes {
+        guardar_epc_server(epc.clone(), antena).await;
         
         let conn = db_state.0.lock().unwrap();
         conn.execute(
@@ -352,7 +359,12 @@ fn extraer_epc_universal(payload: &[u8]) -> Option<LecturaRfid> {
     if payload.len() < 6 {
         return None;
     }
-    let antena    = payload[payload.len() - 2]; // 01, 02, 03 o 04
+    let antena    = payload[payload.len() - 1]; // 01, 02, 03 o 04
+    // validar rango 1 al 4
+    if antena < 1 || antena > 4 {
+        return None;
+    }
+
     // El EPC siempre empieza en byte[2]
     // Los ultimos 4 bytes siempre son RSSI/metadata → los ignoramos
     let epc_start = 2;
@@ -457,7 +469,7 @@ async fn iniciar_lectura(
 
     let mut buffer: Vec<u8> = Vec::new();
     let mut temp = [0u8; 2048];
-    let mut batch_buffer: Vec<String> = Vec::with_capacity(30);
+    let mut batch_buffer: Vec<(String, u8)> = Vec::with_capacity(30);
     let mut ultimo_log = std::time::Instant::now();
     let mut contador_por_segundo = 0;
     let mut contador_total: u32 = 0;  // ← CONTADOR TOTAL CORREGIDO
@@ -493,7 +505,7 @@ async fn iniciar_lectura(
                             let frame = &buffer[i..i + length];
 
                             if frame.len() > 6 && frame[4] == 0x83 {
-                                let payload = &frame[5..frame.len().saturating_sub(2)];
+                                let payload = &frame[5..frame.len().saturating_sub(3)];
                                 
                                 // USAR EL EXTRACTOR UNIVERSAL
                                 if let Some(lectura) = extraer_epc_universal(payload) {
@@ -528,8 +540,10 @@ async fn iniciar_lectura(
                                     app.emit("contador_total", &contador_total).unwrap();
                                     
                                     // Acumular para batch
-                                    batch_buffer.push(lectura.epc.clone());
+                                    batch_buffer.push((lectura.epc.clone(), lectura.antena));
                                     
+                                    // DEBUG temporal
+                                    println!("DEBUG batch: {:?}", batch_buffer);
                                     // Guardar batch cuando alcanza 30 o pasaron 3 segundos
                                     if batch_buffer.len() >= 30 || ultimo_flush.elapsed() >= Duration::from_secs(3) {
                                         let mut conn = db_state.0.lock().unwrap();
