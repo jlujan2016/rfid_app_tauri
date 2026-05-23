@@ -340,17 +340,23 @@ async fn sincronizar_rfid_manual(db_state: State<'_, DbState>) -> Result<String,
     
     Ok(format!("✅ {} EPCs sincronizados con SQL Server", sincronizados))
 }
+// ─── ESTRUCTURA LECTURA RFID ──────────────────────────────────────────────────
+#[derive(Clone)]
+struct LecturaRfid {
+    epc:    String,
+    antena: u8,
+}
 // ─── EXTRAER EPC UNIVERSAL (COMO EL PRIMER PROYECTO) ─────────────────────────
-fn extraer_epc_universal(payload: &[u8]) -> Option<String> {
+fn extraer_epc_universal(payload: &[u8]) -> Option<LecturaRfid> {
     // Método exactamente como el primer proyecto
     if payload.len() < 6 {
         return None;
     }
-    
+    let antena    = payload[payload.len() - 2]; // 01, 02, 03 o 04
     // El EPC siempre empieza en byte[2]
     // Los ultimos 4 bytes siempre son RSSI/metadata → los ignoramos
     let epc_start = 2;
-    let epc_end = payload.len() - 4;
+    let epc_end = payload.len() - 3;
     
     if epc_start >= epc_end {
         return None;
@@ -362,7 +368,7 @@ fn extraer_epc_universal(payload: &[u8]) -> Option<String> {
     if epc.is_empty() {
         None
     } else {
-        Some(epc)
+        Some(LecturaRfid { epc, antena })
     }
 }
 
@@ -421,7 +427,7 @@ async fn iniciar_lectura(
 ) -> Result<(), String> {
     *rfid_state.0.lock().unwrap() = true;
 
-    let mut stream = TcpStream::connect("192.168.1.180:8888")
+    let mut stream = TcpStream::connect("127.0.0.1:5084")
         .await
         .map_err(|e| format!("Error conectando: {}", e))?;
     
@@ -490,18 +496,18 @@ async fn iniciar_lectura(
                                 let payload = &frame[5..frame.len().saturating_sub(2)];
                                 
                                 // USAR EL EXTRACTOR UNIVERSAL
-                                if let Some(epc) = extraer_epc_universal(payload) {
+                                if let Some(lectura) = extraer_epc_universal(payload) {
                                     let now = std::time::Instant::now();
                                     
                                     // Verificar si ya vimos este EPC recientemente (menos de 2 segundos)
-                                    if let Some(last_time) = cache.get(&epc) {
+                                    if let Some(last_time) = cache.get(&lectura.epc) {
                                         if now.duration_since(*last_time) < Duration::from_secs(2) {
                                             continue; // Ignorar duplicado
                                         }
                                     }
                                     
                                     // Insertar en cache
-                                    cache.insert(epc.clone(), now);
+                                    cache.insert(lectura.epc.clone(), now);
                                     
                                     // Contar estadísticas
                                     contador_por_segundo += 1;
@@ -516,18 +522,20 @@ async fn iniciar_lectura(
                                         ultimo_log = std::time::Instant::now();
                                     }
                                     
-                                    // Emitir evento al frontend
-                                    app.emit("tag_leido", &epc).unwrap();
+                                    // Emitir evento al frontend con EPC y antena
+                                    app.emit("tag_leido", &lectura.epc).unwrap();
+                                    app.emit("antena_activa", &lectura.antena).unwrap(); // ← nuevo evento antena
                                     app.emit("contador_total", &contador_total).unwrap();
                                     
                                     // Acumular para batch
-                                    batch_buffer.push(epc);
+                                    batch_buffer.push(lectura.epc.clone());
                                     
                                     // Guardar batch cuando alcanza 30 o pasaron 3 segundos
                                     if batch_buffer.len() >= 30 || ultimo_flush.elapsed() >= Duration::from_secs(3) {
                                         let mut conn = db_state.0.lock().unwrap();
                                         guardar_epcs_batch(&mut conn, &batch_buffer);
-                                        println!("💾 Guardados {} EPCs en SQLite", batch_buffer.len());
+                                        println!("💾 Guardados {} EPCs en SQLite (antena {})", 
+                                            batch_buffer.len(), lectura.antena);
                                         batch_buffer.clear();
                                         ultimo_flush = std::time::Instant::now();
                                     }
