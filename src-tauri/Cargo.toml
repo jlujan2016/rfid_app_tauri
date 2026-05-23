@@ -24,6 +24,7 @@ anyhow = "1"
 md5 = "0.7"
 hex = "0.4"
 futures = "0.3"
+lettre = { version = "0.11.22", features = ["smtp-transport", "native-tls", "builder"] }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 tiberius = { version = "0.12", default-features = false, features = ["native-tls", "chrono", "tds73"] }
