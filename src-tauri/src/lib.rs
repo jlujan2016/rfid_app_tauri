@@ -320,7 +320,44 @@ async fn sincronizar_rfid_pendiente(db_state: tauri::State<'_, DbState>) {
     }
 }
 
+// ─── GUARDAR SALIDA EN SQL SERVER ─────────────────────────────────────────────
+async fn guardar_salida_server(epc: String, antena: u8, alerta: bool) {
+    let mut config = Config::new();
+    config.host("0_Ciberelectrik.mssql.somee.com");
+    config.port(1433);
+    config.database("0_Ciberelectrik");
+    config.authentication(AuthMethod::sql_server("jlujan_SQLLogin_1", "yyeftklvtf"));
+    config.trust_cert();
 
+    let tcp = match TcpStream::connect(config.get_addr()).await {
+        Ok(tcp) => tcp,
+        Err(_) => {
+            println!("⚠️ Sin SQL Server para salida: {}", epc);
+            return;
+        }
+    };
+
+    let mut client = match Client::connect(config, tcp.compat_write()).await {
+        Ok(c) => c,
+        Err(e) => {
+            println!("⚠️ Error SQL Server salida: {}", e);
+            return;
+        }
+    };
+
+    let query = "
+        INSERT INTO LecturasRFID_Salidas (EPC, Antena, Alerta)
+        VALUES (@P1, @P2, @P3)
+    ";
+
+    let antena_i32 = antena as i32;
+    let alerta_i32 = alerta as i32;
+
+    match client.execute(query, &[&epc.as_str(), &antena_i32, &alerta_i32]).await {
+        Ok(_) => println!("💾 Salida SQL Server: {}  alerta: {}", epc, alerta),
+        Err(e) => println!("❌ Error salida SQL Server: {}", e),
+    }
+}
 // ─── COMANDO SINCRONIZAR RFID MANUAL ──────────────────────────────────────────
 #[tauri::command]
 async fn sincronizar_rfid_manual(db_state: State<'_, DbState>) -> Result<String, String> {
@@ -665,6 +702,8 @@ async fn iniciar_lectura(
                                     
                                     if lectura.antena == 2 {
                                         // ── Antena 2: control de salida ──────────────
+                                        // Bloque separado para que conn se libere antes del await
+                                        let (es_alerta, descripcion_alerta) = {
                                         let conn = db_state.0.lock().unwrap();
 
                                         // Verificar si el equipo es Uso Interno
@@ -678,6 +717,15 @@ async fn iniciar_lectura(
                                             params![lectura.epc, lectura.antena as i32, es_alerta as i32],
                                         ).ok();
 
+                                        (es_alerta, descripcion_alerta)
+                                    }; // ← conn se libera aquí automáticamente
+
+                                        // Guardar en SQL Server (todos, con o sin alerta)
+                                        guardar_salida_server(
+                                            lectura.epc.clone(),
+                                            lectura.antena,
+                                            es_alerta
+                                        ).await;
                                         if es_alerta {
                                             let descripcion = descripcion_alerta.unwrap();
                                             println!("🚨 ALERTA USO INTERNO: {} — {}", lectura.epc, descripcion);
