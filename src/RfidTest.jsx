@@ -33,7 +33,8 @@ function RfidTest() {
   const [ultimoTag, setUltimoTag] = useState(null);
   const [lecturasPorSegundo, setLecturasPorSegundo] = useState(0);
   const [contadorBackend, setContadorBackend] = useState(0); // 🔥 Nuevo: contador desde backend
-  
+  const [sincronizando, setSincronizando] = useState(false);
+  const [mensajeSync, setMensajeSync] = useState("");
   const contadorSegundo = useRef(0);
   const lastTime = useRef(Date.now());
 
@@ -120,6 +121,18 @@ function RfidTest() {
     }
   }
 
+  async function sincronizar() {
+    setSincronizando(true);
+    setMensajeSync("");
+    try {
+        const resultado = await invoke("sincronizar");
+        setMensajeSync(resultado);
+    } catch (error) {
+        setMensajeSync("❌ Error: " + error);
+    } finally {
+        setSincronizando(false);
+    }
+  }
   const tagList = Object.values(tags).sort((a, b) => b.count - a.count); // Ordenar por más lecturas
   const totalLecturas = tagList.reduce((sum, t) => sum + t.count, 0);
   const totalTags = tagList.length;
@@ -189,8 +202,30 @@ function RfidTest() {
         >
           🗑️ LIMPIAR
         </button>
-      </div>
 
+        <button 
+          onClick={sincronizar}
+          disabled={sincronizando || leyendo}
+          style={{ ...styles.btn, background: sincronizando ? "#555" : "#2980b9" }}
+        >
+          {sincronizando ? "⏳ SINCRONIZANDO..." : "🔄 SINCRONIZAR"}
+      </button>
+      </div>
+        {/* MENSAJE SINCRONIZACION */}
+        {mensajeSync && (
+            <div style={{ 
+                marginTop: 8, 
+                padding: "8px 12px", 
+                background: "#111", 
+                border: "1px solid #222",
+                borderRadius: 6,
+                fontSize: 11,
+                color: "#6bff8e",
+                textAlign: "center"
+            }}>
+                {mensajeSync}
+            </div>
+        )}
       {/* ESTADÍSTICAS */}
       <div style={styles.stats}>
         <div style={styles.statBox}>

@@ -62,7 +62,30 @@ fn init_db(conn: &Connection) {
          
          CREATE INDEX IF NOT EXISTS idx_epc ON LecturasRFID(EPC);
          CREATE INDEX IF NOT EXISTS idx_fecha ON LecturasRFID(FechaLectura);
-         CREATE INDEX IF NOT EXISTS idx_sincronizado ON LecturasRFID(sincronizado);",
+         CREATE INDEX IF NOT EXISTS idx_sincronizado ON LecturasRFID(sincronizado);
+         CREATE TABLE IF NOT EXISTS EQUIPOS_GLEF (
+    Id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    CODIGO_RFID     TEXT NOT NULL UNIQUE,
+    DESCRIPCION     TEXT,
+    MARCA           TEXT,
+    MODELO          TEXT,
+    CATEGORIA       TEXT,
+    TIPO_PRODUCTO   TEXT,
+    ESTADO          TEXT,
+    ultima_sync     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS LecturasRFID_Salidas (
+    Id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    EPC          TEXT NOT NULL,
+    Antena       INTEGER,
+    FechaLectura TEXT NOT NULL DEFAULT (datetime('now')),
+    Alerta       INTEGER NOT NULL DEFAULT 0,
+    sincronizado INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_rfid_codigo ON EQUIPOS_GLEF(CODIGO_RFID);
+CREATE INDEX IF NOT EXISTS idx_salidas_epc ON LecturasRFID_Salidas(EPC);",
     )
     .expect("Error creando tablas");
 
@@ -415,18 +438,119 @@ async fn login(state: State<'_, DbState>, user: String, pass: String) -> Result<
         Err(_) => Ok(false),
     }
 }
+// ─── OBTENER EQUIPOS DESDE SQL SERVER ────────────────────────────────────────
+async fn sync_equipos_desde_server() -> Result<Vec<(String, String, String, String, String, String, String)>, String> {
+    let mut config = Config::new();
+    config.host("0_Ciberelectrik.mssql.somee.com");
+    config.port(1433);
+    config.database("0_Ciberelectrik");
+    config.authentication(AuthMethod::sql_server("jlujan_SQLLogin_1", "yyeftklvtf"));
+    config.trust_cert();
+
+    let tcp = TcpStream::connect(config.get_addr())
+        .await
+        .map_err(|e| format!("Sin conexión: {}", e))?;
+
+    let mut client = Client::connect(config, tcp.compat_write())
+        .await
+        .map_err(|e| format!("Error autenticando: {}", e))?;
+
+    let stream = client
+        .query(
+            "SELECT CODIGO_RFID, DESCRIPCION, MARCA, MODELO,
+                    CATEGORIA, [TIPO DE PRODUCTO], ESTADO
+             FROM EQUIPOS_GLEF
+             WHERE CODIGO_RFID IS NOT NULL",
+            &[],
+        )
+        .await
+        .map_err(|e| format!("Error consultando: {}", e))?;
+
+    let rows = stream
+        .into_first_result()
+        .await
+        .map_err(|e| format!("Error leyendo filas: {}", e))?;
+
+    let equipos = rows.iter().filter_map(|row| {
+        let codigo_rfid:   &str = row.get(0)?;
+        let descripcion:   &str = row.get(1).unwrap_or("");
+        let marca:         &str = row.get(2).unwrap_or("");
+        let modelo:        &str = row.get(3).unwrap_or("");
+        let categoria:     &str = row.get(4).unwrap_or("");
+        let tipo_producto: &str = row.get(5).unwrap_or("");
+        let estado:        &str = row.get(6).unwrap_or("");
+        Some((
+            codigo_rfid.to_string(),
+            descripcion.to_string(),
+            marca.to_string(),
+            modelo.to_string(),
+            categoria.to_string(),
+            tipo_producto.to_string(),
+            estado.to_string(),
+        ))
+    }).collect();
+
+    Ok(equipos)
+}
+
+// ─── VERIFICAR SI EPC ES USO INTERNO ──────────────────────────────────────────
+fn es_uso_interno(conn: &Connection, epc: &str) -> Option<String> {
+    // Retorna la descripcion del equipo si es Uso Interno, None si no
+    let result = conn.query_row(
+        "SELECT DESCRIPCION FROM EQUIPOS_GLEF 
+         WHERE CODIGO_RFID = ?1 
+         AND TIPO_PRODUCTO = 'Uso Interno'",
+        params![epc],
+        |row| row.get::<_, String>(0),
+    );
+
+    match result {
+        Ok(descripcion) => Some(descripcion),
+        Err(_)          => None,
+    }
+}
 
 // ─── COMANDO SINCRONIZAR ──────────────────────────────────────────────────────
 #[tauri::command]
 async fn sincronizar(state: State<'_, DbState>) -> Result<String, String> {
-    let users = fetch_users_from_server()
-        .await
+    // 1. Obtener datos del servidor (sin tener el lock de SQLite)
+    let users   = fetch_users_from_server().await
         .ok_or_else(|| "No se pudo conectar al servidor".to_string())?;
+    let equipos = sync_equipos_desde_server().await?;
+    // DEBUG temporal
+        println!("DEBUG equipos recibidos: {}", equipos.len());
+        for e in &equipos {
+            println!("  → {:?}", e);
+        }
 
+    // 2. Guardar en SQLite (lock solo aquí, sin await dentro)
     let conn = state.0.lock().unwrap();
-    let count = save_users_to_sqlite(&conn, users);
 
-    Ok(format!("✅ {} usuarios sincronizados", count))
+    let count_users = save_users_to_sqlite(&conn, users);
+
+    let mut count_equipos = 0;
+    for (codigo_rfid, descripcion, marca, modelo, categoria, tipo_producto, estado) in &equipos {
+        if conn.execute(
+            "INSERT INTO EQUIPOS_GLEF
+                (CODIGO_RFID, DESCRIPCION, MARCA, MODELO, CATEGORIA, TIPO_PRODUCTO, ESTADO, ultima_sync)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'))
+             ON CONFLICT(CODIGO_RFID) DO UPDATE SET
+                 DESCRIPCION   = excluded.DESCRIPCION,
+                 MARCA         = excluded.MARCA,
+                 MODELO        = excluded.MODELO,
+                 CATEGORIA     = excluded.CATEGORIA,
+                 TIPO_PRODUCTO = excluded.TIPO_PRODUCTO,
+                 ESTADO        = excluded.ESTADO,
+                 ultima_sync   = excluded.ultima_sync",
+            params![codigo_rfid, descripcion, marca, modelo, categoria, tipo_producto, estado],
+        ).is_ok() {
+            count_equipos += 1;
+        }
+    }
+
+    println!("✅ Equipos sincronizados: {}", count_equipos);
+
+    Ok(format!("✅ {} usuarios y {} equipos sincronizados", count_users, count_equipos))
 }
 
 // ─── COMANDO INICIAR LECTURA RFID - ULTRA RÁPIDO ──────────────────────────────
@@ -539,19 +663,41 @@ async fn iniciar_lectura(
                                     app.emit("antena_activa", &lectura.antena).unwrap(); // ← nuevo evento antena
                                     app.emit("contador_total", &contador_total).unwrap();
                                     
-                                    // Acumular para batch
-                                    batch_buffer.push((lectura.epc.clone(), lectura.antena));
-                                    
-                                    // DEBUG temporal
-                                    println!("DEBUG batch: {:?}", batch_buffer);
-                                    // Guardar batch cuando alcanza 30 o pasaron 3 segundos
-                                    if batch_buffer.len() >= 30 || ultimo_flush.elapsed() >= Duration::from_secs(3) {
-                                        let mut conn = db_state.0.lock().unwrap();
-                                        guardar_epcs_batch(&mut conn, &batch_buffer);
-                                        println!("💾 Guardados {} EPCs en SQLite (antena {})", 
-                                            batch_buffer.len(), lectura.antena);
-                                        batch_buffer.clear();
-                                        ultimo_flush = std::time::Instant::now();
+                                    if lectura.antena == 2 {
+                                        // ── Antena 2: control de salida ──────────────
+                                        let conn = db_state.0.lock().unwrap();
+
+                                        // Verificar si el equipo es Uso Interno
+                                        let descripcion_alerta = es_uso_interno(&conn, &lectura.epc);
+                                        let es_alerta = descripcion_alerta.is_some();
+
+                                        // Guardar en tabla de salidas
+                                        conn.execute(
+                                            "INSERT INTO LecturasRFID_Salidas (EPC, Antena, FechaLectura, Alerta)
+                                             VALUES (?1, ?2, datetime('now'), ?3)",
+                                            params![lectura.epc, lectura.antena as i32, es_alerta as i32],
+                                        ).ok();
+
+                                        if es_alerta {
+                                            let descripcion = descripcion_alerta.unwrap();
+                                            println!("🚨 ALERTA USO INTERNO: {} — {}", lectura.epc, descripcion);
+                                            app.emit("alerta_uso_interno", &lectura.epc).unwrap();
+                                        }
+
+                                        app.emit("tag_salida", &lectura.epc).unwrap();
+
+                                    } else {
+                                        // ── Antena 1 y otras: inventario general ─────
+                                        batch_buffer.push((lectura.epc.clone(), lectura.antena));
+
+                                        if batch_buffer.len() >= 30 || ultimo_flush.elapsed() >= Duration::from_secs(3) {
+                                            let mut conn = db_state.0.lock().unwrap();
+                                            guardar_epcs_batch(&mut conn, &batch_buffer);
+                                            println!("💾 Guardados {} EPCs en SQLite (antena {})",
+                                                batch_buffer.len(), lectura.antena);
+                                            batch_buffer.clear();
+                                            ultimo_flush = std::time::Instant::now();
+                                        }
                                     }
                                 }
                             }
