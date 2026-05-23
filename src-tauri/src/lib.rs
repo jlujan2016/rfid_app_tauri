@@ -85,7 +85,13 @@ CREATE TABLE IF NOT EXISTS LecturasRFID_Salidas (
 );
 
 CREATE INDEX IF NOT EXISTS idx_rfid_codigo ON EQUIPOS_GLEF(CODIGO_RFID);
-CREATE INDEX IF NOT EXISTS idx_salidas_epc ON LecturasRFID_Salidas(EPC);",
+CREATE INDEX IF NOT EXISTS idx_salidas_epc ON LecturasRFID_Salidas(EPC);
+CREATE TABLE IF NOT EXISTS destinatarios_alerta (
+    Id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    correo  TEXT NOT NULL UNIQUE,
+    nombre  TEXT,
+    activo  INTEGER NOT NULL DEFAULT 1
+);",
     )
     .expect("Error creando tablas");
 
@@ -547,20 +553,77 @@ fn es_uso_interno(conn: &Connection, epc: &str) -> Option<String> {
     }
 }
 
+// ─── OBTENER DESTINATARIOS DESDE SQL SERVER ───────────────────────────────────
+async fn fetch_destinatarios_from_server() -> Vec<(String, String)> {
+    let mut config = Config::new();
+    config.host("0_Ciberelectrik.mssql.somee.com");
+    config.port(1433);
+    config.database("0_Ciberelectrik");
+    config.authentication(AuthMethod::sql_server("jlujan_SQLLogin_1", "yyeftklvtf"));
+    config.trust_cert();
+
+    let tcp = match TcpStream::connect(config.get_addr()).await {
+        Ok(tcp) => tcp,
+        Err(_) => return vec![],
+    };
+
+    let mut client = match Client::connect(config, tcp.compat_write()).await {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+
+    let stream = match client
+        .query(
+            "SELECT correo, ISNULL(nombre, '') FROM destinatarios_alerta 
+             WHERE activo = 1",
+            &[],
+        )
+        .await
+    {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+
+    let rows = match stream.into_first_result().await {
+        Ok(r) => r,
+        Err(_) => return vec![],
+    };
+
+    rows.iter().filter_map(|row| {
+        let correo: &str = row.get(0)?;
+        let nombre: &str = row.get(1)?;
+        Some((correo.to_string(), nombre.to_string()))
+    }).collect()
+}
+
+// ─── GUARDAR DESTINATARIOS EN SQLITE ─────────────────────────────────────────
+fn save_destinatarios_to_sqlite(conn: &Connection, destinatarios: Vec<(String, String)>) -> usize {
+    let mut count = 0;
+    for (correo, nombre) in &destinatarios {
+        if conn.execute(
+            "INSERT INTO destinatarios_alerta (correo, nombre, activo)
+             VALUES (?1, ?2, 1)
+             ON CONFLICT(correo) DO UPDATE SET
+                 nombre = excluded.nombre,
+                 activo = excluded.activo",
+            params![correo, nombre],
+        ).is_ok() {
+            count += 1;
+        }
+    }
+    count
+}
+
 // ─── COMANDO SINCRONIZAR ──────────────────────────────────────────────────────
 #[tauri::command]
 async fn sincronizar(state: State<'_, DbState>) -> Result<String, String> {
-    // 1. Obtener datos del servidor (sin tener el lock de SQLite)
-    let users   = fetch_users_from_server().await
+    // 1. Obtener TODOS los datos del servidor primero (sin lock de SQLite)
+    let users         = fetch_users_from_server().await
         .ok_or_else(|| "No se pudo conectar al servidor".to_string())?;
-    let equipos = sync_equipos_desde_server().await?;
-    // DEBUG temporal
-        println!("DEBUG equipos recibidos: {}", equipos.len());
-        for e in &equipos {
-            println!("  → {:?}", e);
-        }
+    let equipos       = sync_equipos_desde_server().await?;
+    let destinatarios = fetch_destinatarios_from_server().await;
 
-    // 2. Guardar en SQLite (lock solo aquí, sin await dentro)
+    // 2. Guardar TODO en SQLite (lock solo aquí, sin ningún await dentro)
     let conn = state.0.lock().unwrap();
 
     let count_users = save_users_to_sqlite(&conn, users);
@@ -585,9 +648,15 @@ async fn sincronizar(state: State<'_, DbState>) -> Result<String, String> {
         }
     }
 
-    println!("✅ Equipos sincronizados: {}", count_equipos);
+    let count_destinatarios = save_destinatarios_to_sqlite(&conn, destinatarios);
 
-    Ok(format!("✅ {} usuarios y {} equipos sincronizados", count_users, count_equipos))
+    println!("✅ Usuarios: {}  Equipos: {}  Destinatarios: {}", 
+        count_users, count_equipos, count_destinatarios);
+
+    Ok(format!(
+        "✅ {} usuarios, {} equipos y {} destinatarios sincronizados",
+        count_users, count_equipos, count_destinatarios
+    ))
 }
 
 // ─── COMANDO INICIAR LECTURA RFID - ULTRA RÁPIDO ──────────────────────────────
