@@ -950,6 +950,7 @@ pub fn run() {
     dotenv().ok(); // ← cargar .env
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init()) // ← Para la notificacion en sistema operativo
         .setup(|app| {
             let db_path = app
                 .path()

@@ -37,7 +37,8 @@ function RfidTest() {
   const [mensajeSync, setMensajeSync] = useState("");
   const contadorSegundo = useRef(0);
   const lastTime = useRef(Date.now());
-
+  const [alertas, setAlertas]         = useState([]);
+  const [panelAbierto, setPanelAbierto] = useState(false);
   // 🔥 ACTUALIZACIÓN INMEDIATA (sin throttle)
   const actualizarTag = (epc) => {
     const ahora = Date.now();
@@ -72,7 +73,28 @@ function RfidTest() {
     const unlisten = listen("tag_leido", (event) => {
       actualizarTag(event.payload);
     });
+    const unlistenAlerta = listen("alerta_uso_interno", (event) => {
+        const epc = event.payload;
+        const nuevaAlerta = {
+            epc,
+            hora: new Date().toLocaleTimeString(),
+            id:   Date.now(),
+        };
 
+        // Agregar al historial
+        setAlertas(prev => [nuevaAlerta, ...prev]);
+
+        // Abrir panel automáticamente
+        setPanelAbierto(true);
+
+        // Notificación de Windows 11
+        import("@tauri-apps/plugin-notification").then(({ sendNotification }) => {
+            sendNotification({
+                title: "🚨 ALERTA USO INTERNO",
+                body:  `Equipo detectado saliendo: ${epc}`,
+            });
+        });
+    });
     // Listener para estado del lector
     const unlistenEstado = listen("rfid_estado", (event) => {
       setEstado(event.payload);
@@ -84,11 +106,13 @@ function RfidTest() {
     const unlistenContador = listen("contador_total", (event) => {
       setContadorBackend(event.payload);
     });
+    
 
     return () => {
       unlisten.then(fn => fn());
       unlistenEstado.then(fn => fn());
       unlistenContador.then(fn => fn());
+      unlistenAlerta.then(fn => fn());
     };
   }, []);
 
@@ -210,6 +234,36 @@ function RfidTest() {
         >
           {sincronizando ? "⏳ SINCRONIZANDO..." : "🔄 SINCRONIZAR"}
       </button>
+      {/* BOTÓN ALERTAS */}
+      <button
+          onClick={() => setPanelAbierto(!panelAbierto)}
+          style={{
+              ...styles.btn,
+              background: alertas.length > 0 ? "#c0392b" : "#34495e",
+              position: "relative"
+          }}
+      >
+          🚨 ALERTAS
+          {alertas.length > 0 && (
+              <span style={{
+                  position:   "absolute",
+                  top:        -6,
+                  right:      -6,
+                  background: "#ff0000",
+                  color:      "white",
+                  borderRadius: "50%",
+                  width:      18,
+                  height:     18,
+                  fontSize:   11,
+                  display:    "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  fontWeight: "bold"
+              }}>
+                  {alertas.length}
+              </span>
+          )}
+      </button>
       </div>
         {/* MENSAJE SINCRONIZACION */}
         {mensajeSync && (
@@ -290,6 +344,80 @@ function RfidTest() {
           ⚡ Velocidad: hasta <strong>30+ lecturas/segundo</strong>
         </p>
       </div>
+      {/* PANEL LATERAL DE ALERTAS */}
+      {panelAbierto && (
+          <div style={{
+              position:   "fixed",
+              top:        0,
+              right:      0,
+              width:      320,
+              height:     "100vh",
+              background: "#0f0f0f",
+              borderLeft: "2px solid #c0392b",
+              zIndex:     1000,
+              display:    "flex",
+              flexDirection: "column",
+              padding:    16,
+              overflowY:  "auto"
+          }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+                  <h3 style={{ color: "#c0392b", margin: 0, fontSize: 14 }}>
+                      🚨 ALERTAS USO INTERNO ({alertas.length})
+                  </h3>
+                  <button
+                      onClick={() => setPanelAbierto(false)}
+                      style={{ background: "none", border: "none", color: "#888", cursor: "pointer", fontSize: 18 }}
+                  >
+                      ✕
+                  </button>
+              </div>
+
+              {alertas.length === 0 ? (
+                  <p style={{ color: "#444", fontSize: 12, textAlign: "center" }}>
+                      Sin alertas registradas
+                  </p>
+              ) : (
+                  alertas.map(alerta => (
+                      <div key={alerta.id} style={{
+                          background:   "#1a0000",
+                          border:       "1px solid #c0392b",
+                          borderRadius: 6,
+                          padding:      12,
+                          marginBottom: 10
+                      }}>
+                          <div style={{ color: "#ff6b6b", fontWeight: "bold", fontSize: 13 }}>
+                              🏷️ {alerta.epc}
+                          </div>
+                          <div style={{ color: "#666", fontSize: 11, marginTop: 4 }}>
+                              🕐 {alerta.hora}
+                          </div>
+                          <div style={{ color: "#ff4444", fontSize: 11, marginTop: 4 }}>
+                              ⚠️ Equipo uso interno — salida no autorizada
+                          </div>
+                      </div>
+                  ))
+              )}
+
+              {alertas.length > 0 && (
+                  <button
+                      onClick={() => setAlertas([])}
+                      style={{
+                          marginTop:    "auto",
+                          padding:      10,
+                          background:   "#1a1a1a",
+                          border:       "1px solid #333",
+                          color:        "#888",
+                          borderRadius: 6,
+                          cursor:       "pointer",
+                          fontSize:     12
+                      }}
+                  >
+                      🗑️ Limpiar historial
+                  </button>
+              )}
+          </div>
+      )}
+
     </div>
   );
 }
