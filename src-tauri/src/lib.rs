@@ -6,6 +6,8 @@ use tiberius::{AuthMethod, Client, Config};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
+use dotenvy::dotenv;
+use std::env;
 
 // ─── ESTADOS GLOBALES ─────────────────────────────────────────────────────────
 pub struct DbState(pub Mutex<Connection>);
@@ -659,6 +661,77 @@ async fn sincronizar(state: State<'_, DbState>) -> Result<String, String> {
     ))
 }
 
+// ─── ENVIAR EMAIL DE ALERTA ───────────────────────────────────────────────────
+fn enviar_email_alerta(
+    destinatarios: Vec<String>,
+    epc: &str,
+    descripcion: &str,
+) {
+    use lettre::{
+        Message, SmtpTransport, Transport,
+        message::header::ContentType,
+        transport::smtp::authentication::Credentials,
+    };
+
+    // Leer credenciales del .env
+    let gmail_user = match env::var("GMAIL_USER") {
+        Ok(v)  => v,
+        Err(_) => {
+            println!("❌ GMAIL_USER no configurado en .env");
+            return;
+        }
+    };
+    let gmail_pass = match env::var("GMAIL_PASS") {
+        Ok(v)  => v,
+        Err(_) => {
+            println!("❌ GMAIL_PASS no configurado en .env");
+            return;
+        }
+    };
+
+    let creds = Credentials::new(gmail_user.clone(), gmail_pass);
+
+    let mailer = match SmtpTransport::relay("smtp.gmail.com") {
+        Ok(m) => m.credentials(creds).build(),
+        Err(e) => {
+            println!("❌ Error configurando SMTP: {}", e);
+            return;
+        }
+    };
+
+    let asunto  = format!("🚨 ALERTA: Equipo uso interno detectado saliendo");
+    let cuerpo  = format!(
+        "Se detectó un equipo de uso interno intentando salir.\n\n\
+         EPC      : {}\n\
+         Equipo   : {}\n\
+         Fecha    : {}\n\n\
+         Por favor tome las medidas necesarias.",
+        epc,
+        descripcion,
+        chrono::Local::now().format("%d/%m/%Y %H:%M:%S")
+    );
+
+    for correo in &destinatarios {
+        let email = match Message::builder()
+            .from(gmail_user.parse().unwrap())
+            .to(correo.parse().unwrap())
+            .subject(&asunto)
+            .header(ContentType::TEXT_PLAIN)
+            .body(cuerpo.clone())
+        {
+            Ok(e) => e,
+            Err(e) => {
+                println!("❌ Error construyendo email para {}: {}", correo, e);
+                continue;
+            }
+        };
+
+        match mailer.send(&email) {
+            Ok(_)  => println!("📧 Email enviado a: {}", correo),
+            Err(e) => println!("❌ Error enviando a {}: {}", correo, e),
+        }
+    }
+}
 // ─── COMANDO INICIAR LECTURA RFID - ULTRA RÁPIDO ──────────────────────────────
 // ─── COMANDO INICIAR LECTURA RFID - ULTRA RÁPIDO (CONTADOR CORREGIDO) ─────────
 #[tauri::command]
@@ -799,6 +872,26 @@ async fn iniciar_lectura(
                                             let descripcion = descripcion_alerta.unwrap();
                                             println!("🚨 ALERTA USO INTERNO: {} — {}", lectura.epc, descripcion);
                                             app.emit("alerta_uso_interno", &lectura.epc).unwrap();
+
+                                            // Obtener destinatarios de SQLite y enviar email
+                                            let correos: Vec<String> = {
+                                                let conn = db_state.0.lock().unwrap();
+                                                let mut stmt = conn.prepare(
+                                                    "SELECT correo FROM destinatarios_alerta WHERE activo = 1"
+                                                ).unwrap();
+                                                stmt.query_map([], |row| row.get(0))
+                                                    .unwrap()
+                                                    .filter_map(|r| r.ok())
+                                                    .collect()
+                                            };
+
+                                            let epc_clone  = lectura.epc.clone();
+                                            let desc_clone = descripcion.clone();
+
+                                            // Enviar en hilo separado para no bloquear la lectura RFID
+                                            tokio::task::spawn_blocking(move || {
+                                                enviar_email_alerta(correos, &epc_clone, &desc_clone);
+                                            });
                                         }
 
                                         app.emit("tag_salida", &lectura.epc).unwrap();
@@ -854,6 +947,7 @@ fn detener_lectura(rfid_state: State<'_, RfidState>) {
 // ─── ENTRY POINT ─────────────────────────────────────────────────────────────
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    dotenv().ok(); // ← cargar .env
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
