@@ -9,16 +9,35 @@ const ROOM_SIZE = 8;
 const ROOM_HALF = ROOM_SIZE / 2;
 
 const INITIAL_BOXES = [
-  { id: 'CAJA-001', name: 'Zapatillas Nike', position: [-2, 1.5, -3], size: [0.8, 0.6, 0.8], color: '#f39c12', read: false, inRoom: true },
+  { id: 'CAJA-001', name: 'Zapatillas', position: [-2, 1.5, -3], size: [0.8, 0.6, 0.8], color: '#f39c12', read: false, inRoom: true },
   { id: 'CAJA-002', name: 'Laptop Dell', position: [-2, 2.5, -3], size: [1.2, 0.3, 0.9], color: '#3498db', read: false, inRoom: true },
-  { id: 'CAJA-003', name: 'Monitor LG', position: [0, 1.5, -3], size: [1.5, 1.2, 0.5], color: '#9b59b6', read: false, inRoom: true },
+  { id: 'CAJA-003', name: 'Monitor LG', position: [0, 1.4, -3], size: [1.5, 0.6, 0.5], color: '#9b59b6', read: false, inRoom: true },
   { id: 'CAJA-004', name: 'Teclado Mecánico', position: [2, 1.5, -3], size: [1.0, 0.2, 0.4], color: '#e74c3c', read: false, inRoom: true },
   { id: 'CAJA-005', name: 'Mouse Inalámbrico', position: [2, 2.5, -3], size: [0.3, 0.2, 0.3], color: '#1abc9c', read: false, inRoom: true },
-  { id: 'CAJA-006', name: 'Silla Gamer', position: [2, 0.5, 0], size: [1.2, 1.2, 1.2], color: '#e67e22', read: false, inRoom: true },
+  { id: 'CAJA-006', name: 'Silla Ergonómica', position: [2, 0.5, 0], size: [1.2, 1.2, 1.2], color: '#e67e22', read: false, inRoom: true },
   { id: 'CAJA-007', name: 'Escritorio', position: [-2, 0.5, 2], size: [1.5, 1.0, 1.5], color: '#7f8c8d', read: false, inRoom: true },
 ];
 
-const Antenna = ({ position, rotation }) => {
+const Antenna = ({ position, rotation, isReading }) => {
+  const waveRef = useRef();
+
+  useFrame(() => {
+    if (isReading && waveRef.current) {
+      waveRef.current.scale.x += 0.03;
+      waveRef.current.scale.y += 0.03;
+      waveRef.current.scale.z += 0.03;
+      waveRef.current.material.opacity -= 0.005;
+
+      if (waveRef.current.scale.x > 3.5) {
+        waveRef.current.scale.set(0.1, 0.1, 0.1);
+        waveRef.current.material.opacity = 0.5;
+      }
+    } else if (waveRef.current) {
+      waveRef.current.scale.set(0.1, 0.1, 0.1);
+      waveRef.current.material.opacity = 0;
+    }
+  });
+
   return (
     <group position={position} rotation={rotation}>
       <Box args={[0.4, 0.4, 0.1]} position={[0, 0, 0]}>
@@ -27,6 +46,10 @@ const Antenna = ({ position, rotation }) => {
       <Cylinder args={[0.05, 0.05, 0.5]} position={[0, -0.2, -0.1]} rotation={[Math.PI / 2, 0, 0]}>
         <meshStandardMaterial color="#bdc3c7" />
       </Cylinder>
+      <mesh ref={waveRef} position={[0, -0.2, -0.1]}>
+         <sphereGeometry args={[1, 16, 16]} />
+         <meshBasicMaterial color="#3498db" transparent opacity={0} wireframe />
+      </mesh>
     </group>
   );
 };
@@ -98,7 +121,7 @@ const DraggableBoxBox = ({ box, onDrag, onDragEnd }) => {
   );
 };
 
-const Room = () => {
+const Room = ({ isReading }) => {
   return (
     <group>
       {/* Floor */}
@@ -130,9 +153,9 @@ const Room = () => {
       </Box>
 
       {/* Antennas in 3 corners */}
-      <Antenna position={[-ROOM_HALF + 0.5, 3, -ROOM_HALF + 0.5]} rotation={[Math.PI/4, Math.PI/4, 0]} />
-      <Antenna position={[ROOM_HALF - 0.5, 3, -ROOM_HALF + 0.5]} rotation={[Math.PI/4, -Math.PI/4, 0]} />
-      <Antenna position={[-ROOM_HALF + 0.5, 3, ROOM_HALF - 0.5]} rotation={[Math.PI/4, 3*Math.PI/4, 0]} />
+      <Antenna position={[-ROOM_HALF + 0.5, 3, -ROOM_HALF + 0.5]} rotation={[Math.PI/4, Math.PI/4, 0]} isReading={isReading} />
+      <Antenna position={[ROOM_HALF - 0.5, 3, -ROOM_HALF + 0.5]} rotation={[Math.PI/4, -Math.PI/4, 0]} isReading={isReading} />
+      <Antenna position={[-ROOM_HALF + 0.5, 3, ROOM_HALF - 0.5]} rotation={[Math.PI/4, 3*Math.PI/4, 0]} isReading={isReading} />
     </group>
   );
 };
@@ -214,7 +237,7 @@ function RfidSimulation() {
         <Canvas shadows camera={{ position: [0, 5, 8], fov: 50 }}>
           <ambientLight intensity={0.5} />
           <directionalLight position={[10, 10, 5]} intensity={1} castShadow shadow-mapSize={[1024, 1024]} />
-          <Room />
+          <Room isReading={isReading} />
           {boxes.map(box => (
             <DraggableBoxBox 
               key={box.id} 

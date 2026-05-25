@@ -19,6 +19,8 @@ pub struct Equipo {
     pub categoria: Option<String>,
     pub cantidad: Option<i32>,
     pub almacen: Option<String>,
+    pub permiso_salida: Option<bool>,
+    pub estado_ubicacion: Option<String>,
     pub status: String,
 }
 
@@ -76,6 +78,8 @@ fn init_db(conn: &Connection) {
             categoria     TEXT,
             cantidad      INTEGER,
             almacen       TEXT,
+            permiso_salida INTEGER DEFAULT 0,
+            estado_ubicacion TEXT DEFAULT 'En Oficina',
             updated_at    TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS LecturasRFID (
@@ -87,8 +91,10 @@ fn init_db(conn: &Connection) {
     )
     .expect("Error creando tablas");
 
-    // Intentamos agregar la columna si la tabla ya existía de antes
+    // Intentamos agregar columnas si la tabla ya existía de antes
     let _ = conn.execute("ALTER TABLE equipos_glef ADD COLUMN almacen TEXT", []);
+    let _ = conn.execute("ALTER TABLE equipos_glef ADD COLUMN permiso_salida INTEGER DEFAULT 0", []);
+    let _ = conn.execute("ALTER TABLE equipos_glef ADD COLUMN estado_ubicacion TEXT DEFAULT 'En Oficina'", []);
 
     // Crear usuario admin por defecto solo si no existe
     // Contraseña: 1234 hasheada con MD5
@@ -247,6 +253,8 @@ async fn fetch_inventory_from_server() -> Option<Vec<Equipo>> {
                 categoria: categoria.map(|s| s.to_string()),
                 cantidad,
                 almacen: almacen.map(|s| s.to_string()),
+                permiso_salida: None,
+                estado_ubicacion: None,
                 status: "missing".to_string(),
             });
         }
@@ -292,14 +300,17 @@ fn save_inventory_to_sqlite(conn: &Connection, inventory: Vec<Equipo>) -> usize 
 // ─── GUARDAR EPC EN SQLITE ────────────────────────────────────────────────────
 // Guarda cada lectura RFID en SQLite con sincronizado=0 (pendiente)
 // Siempre guarda todas las lecturas con fecha para historial completo
-fn guardar_epc_sqlite(conn: &Connection, epc: &str) {
-    match conn.execute(
-        "INSERT INTO LecturasRFID (EPC, FechaLectura, sincronizado)
-         VALUES (?1, datetime('now'), 0)",
-        params![epc],
-    ) {
-        Ok(_) => println!("💾 SQLite INSERT OK: {}", epc),
-        Err(e) => println!("❌ SQLite ERROR: {}", e),
+fn guardar_epcs_batch(conn: &mut Connection, epcs: &[String]) {
+    let tx = conn.transaction().expect("Error iniciando transacción");
+    for epc in epcs {
+        match tx.execute(
+            "INSERT INTO LecturasRFID (EPC, FechaLectura, sincronizado)
+             VALUES (?1, datetime('now'), 0)",
+            params![epc],
+        ) {
+            Ok(_) => println!("💾 SQLite INSERT OK: {}", epc),
+            Err(e) => println!("❌ SQLite ERROR: {}", e),
+        }
     }
     tx.commit().expect("Error commit transacción");
     println!("💾 Batch SQLite: {} registros", epcs.len());
@@ -396,7 +407,7 @@ async fn sincronizar(state: State<'_, DbState>) -> Result<String, String> {
 #[tauri::command]
 fn obtener_inventario_local(state: State<'_, DbState>) -> Result<Vec<Equipo>, String> {
     let conn = state.0.lock().unwrap();
-    let mut stmt = conn.prepare("SELECT codigo_rfid, item, numero_serie, descripcion, marca, modelo, categoria, cantidad, almacen FROM equipos_glef").map_err(|e| e.to_string())?;
+    let mut stmt = conn.prepare("SELECT codigo_rfid, item, numero_serie, descripcion, marca, modelo, categoria, cantidad, almacen, permiso_salida, estado_ubicacion FROM equipos_glef").map_err(|e| e.to_string())?;
     
     let rows = stmt.query_map([], |row| {
         Ok(Equipo {
@@ -409,6 +420,8 @@ fn obtener_inventario_local(state: State<'_, DbState>) -> Result<Vec<Equipo>, St
             categoria: row.get(6)?,
             cantidad: row.get(7)?,
             almacen: row.get(8)?,
+            permiso_salida: row.get(9).ok(),
+            estado_ubicacion: row.get(10).ok(),
             status: "missing".to_string(),
         })
     }).map_err(|e| e.to_string())?;
@@ -573,6 +586,83 @@ fn detener_lectura(rfid_state: State<'_, RfidState>) {
     println!("🛑 Señal de detener enviada");
 }
 
+// ─── CONTROL DE PUERTA ────────────────────────────────────────────────────────
+#[tauri::command]
+async fn cambiar_permiso_salida(state: State<'_, DbState>, codigo_rfid: String, admin_pass: String) -> Result<String, String> {
+    let conn = state.0.lock().unwrap();
+    let result = conn.query_row(
+        "SELECT password_hash FROM users WHERE username = 'admin'",
+        [],
+        |row| row.get::<_, String>(0),
+    );
+    let password_hash = result.unwrap_or_default();
+    let input_hash = hash_md5(&admin_pass);
+    if input_hash != password_hash {
+        return Err("Contraseña incorrecta".to_string());
+    }
+
+    let act = conn.execute(
+        "UPDATE equipos_glef SET permiso_salida = CASE WHEN permiso_salida = 1 THEN 0 ELSE 1 END WHERE codigo_rfid = ?1",
+        params![codigo_rfid],
+    ).map_err(|e| e.to_string())?;
+    
+    if act == 0 {
+        return Err("Equipo no encontrado".to_string());
+    }
+    
+    Ok("Permiso actualizado".to_string())
+}
+
+#[derive(serde::Serialize)]
+pub struct CruceResultado {
+    pub codigo_rfid: String,
+    pub estado_anterior: String,
+    pub nuevo_estado: String,
+    pub alarma: bool,
+    pub nombre_item: String,
+}
+
+#[tauri::command]
+async fn registrar_cruce_puerta(state: State<'_, DbState>, codigo_rfid: String) -> Result<CruceResultado, String> {
+    let conn = state.0.lock().unwrap();
+    
+    let eq = conn.query_row(
+        "SELECT estado_ubicacion, permiso_salida, item FROM equipos_glef WHERE codigo_rfid = ?1",
+        params![codigo_rfid.clone()],
+        |row| {
+            let estado: String = row.get(0).unwrap_or_else(|_| "En Oficina".to_string());
+            let permiso: bool = row.get(1).unwrap_or(false);
+            let item: Option<String> = row.get(2).ok().flatten();
+            Ok((estado, permiso, item.unwrap_or_else(|| "Desconocido".to_string())))
+        },
+    ).map_err(|e| e.to_string())?;
+
+    let estado_anterior = eq.0;
+    let permiso_salida = eq.1;
+    let nombre_item = eq.2;
+
+    let nuevo_estado = if estado_anterior == "En Oficina" {
+        "Afuera".to_string()
+    } else {
+        "En Oficina".to_string()
+    };
+
+    let alarma = nuevo_estado == "Afuera" && !permiso_salida;
+
+    conn.execute(
+        "UPDATE equipos_glef SET estado_ubicacion = ?1 WHERE codigo_rfid = ?2",
+        params![nuevo_estado, codigo_rfid],
+    ).map_err(|e| e.to_string())?;
+
+    Ok(CruceResultado {
+        codigo_rfid,
+        estado_anterior,
+        nuevo_estado,
+        alarma,
+        nombre_item,
+    })
+}
+
 // ─── ENTRY POINT ─────────────────────────────────────────────────────────────
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -605,7 +695,9 @@ pub fn run() {
             obtener_inventario_local, 
             sincronizar_inventario,
             iniciar_lectura,
-            detener_lectura
+            detener_lectura,
+            cambiar_permiso_salida,
+            registrar_cruce_puerta
         ])
         .run(tauri::generate_context!())
         .expect("Error iniciando Tauri");

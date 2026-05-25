@@ -5,6 +5,9 @@ import InventoryDashboard from "./InventoryDashboard";
 import RfidTest from "./RfidTest";
 import RfidSimulation from "./RfidSimulation";
 
+import DoorSimulation from "./DoorSimulation";
+import DoorControlDashboard from "./DoorControlDashboard";
+
 function App() {
   const [logged, setLogged] = useState(false);
   const [activeTab, setActiveTab] = useState("dashboard");
@@ -26,11 +29,26 @@ function App() {
           onClick={() => setActiveTab("simulation")}
           style={{ padding: '8px 16px', background: activeTab === "simulation" ? '#3b82f6' : 'transparent', color: activeTab === "simulation" ? 'white' : '#94a3b8', border: '1px solid #3b82f6', borderRadius: '4px', cursor: 'pointer', fontWeight: '500' }}
         >
-          Simulación 3D
+          Inventario 3D
+        </button>
+        <button 
+          onClick={() => setActiveTab("doorControl")}
+          style={{ padding: '8px 16px', background: activeTab === "doorControl" ? '#3b82f6' : 'transparent', color: activeTab === "doorControl" ? 'white' : '#94a3b8', border: '1px solid #3b82f6', borderRadius: '4px', cursor: 'pointer', fontWeight: '500' }}
+        >
+          Dashboard Puerta
+        </button>
+        <button 
+          onClick={() => setActiveTab("door")}
+          style={{ padding: '8px 16px', background: activeTab === "door" ? '#3b82f6' : 'transparent', color: activeTab === "door" ? 'white' : '#94a3b8', border: '1px solid #3b82f6', borderRadius: '4px', cursor: 'pointer', fontWeight: '500' }}
+        >
+          Control Puerta
         </button>
       </nav>
       <div style={{ flex: 1, overflow: activeTab === "dashboard" ? "auto" : "hidden", position: 'relative' }}>
-        {activeTab === "dashboard" ? <InventoryDashboard /> : <RfidSimulation />}
+        {activeTab === "dashboard" && <InventoryDashboard />}
+        {activeTab === "simulation" && <RfidSimulation />}
+        {activeTab === "doorControl" && <DoorControlDashboard />}
+        {activeTab === "door" && <DoorSimulation />}
       </div>
     </div>
   );
