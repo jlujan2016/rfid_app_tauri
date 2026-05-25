@@ -742,7 +742,7 @@ async fn iniciar_lectura(
 ) -> Result<(), String> {
     *rfid_state.0.lock().unwrap() = true;
 
-    let mut stream = TcpStream::connect("127.0.0.1:5084")
+    let mut stream = TcpStream::connect("192.168.1.180:5002")
         .await
         .map_err(|e| format!("Error conectando: {}", e))?;
     
@@ -855,7 +855,7 @@ async fn iniciar_lectura(
                                         // Guardar en tabla de salidas
                                         conn.execute(
                                             "INSERT INTO LecturasRFID_Salidas (EPC, Antena, FechaLectura, Alerta)
-                                             VALUES (?1, ?2, datetime('now'), ?3)",
+                                             VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), ?3)", 
                                             params![lectura.epc, lectura.antena as i32, es_alerta as i32],
                                         ).ok();
 
