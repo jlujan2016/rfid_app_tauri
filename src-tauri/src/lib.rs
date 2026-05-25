@@ -94,6 +94,8 @@ fn init_db(conn: &Connection) {
     // Intentamos agregar la columna si la tabla ya existía de antes
     let _ = conn.execute("ALTER TABLE equipos_glef ADD COLUMN almacen TEXT", []);
 
+    // Crear usuario admin por defecto solo si no existe
+    // Contraseña: 1234 hasheada con MD5
     let count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM users WHERE username = 'admin'",
