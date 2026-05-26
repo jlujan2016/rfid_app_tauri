@@ -38,6 +38,27 @@ fn build_command(command: u8, data: &[u8]) -> Vec<u8> {
     frame
 }
 
+// ─── CONTROL RELAY UR4 (usa stream compartido) ────────────────────────────────
+async fn relay_on(stream: &mut tokio::net::TcpStream) -> Result<(), String> {
+    stream
+        .write_all(&build_command(0xA1, &[0x09, 0x00, 0x00, 0x01]))
+        .await
+        .map_err(|e| e.to_string())?;
+    println!("🔓 RELAY ON");
+    Ok(())
+}
+
+async fn relay_off(stream: &mut tokio::net::TcpStream) -> Result<(), String> {
+    stream
+        .write_all(&build_command(0xA1, &[0x09, 0x00, 0x00, 0x00]))
+        .await
+        .map_err(|e| e.to_string())?;
+    println!("🔒 RELAY OFF");
+    Ok(())
+}
+
+
+
 // ─── INICIALIZAR BASE DE DATOS ────────────────────────────────────────────────
 fn init_db(conn: &Connection) {
     conn.execute_batch(
@@ -843,37 +864,47 @@ async fn iniciar_lectura(
                                     app.emit("contador_total", &contador_total).unwrap();
                                     
                                     if lectura.antena == 2 {
-                                        // ── Antena 2: control de salida ──────────────
-                                        // Bloque separado para que conn se libere antes del await
+                                        // ── Antena 2: control de salida ──────────────────────
                                         let (es_alerta, descripcion_alerta) = {
-                                        let conn = db_state.0.lock().unwrap();
+                                            let conn = db_state.0.lock().unwrap();
+                                            let descripcion_alerta = es_uso_interno(&conn, &lectura.epc);
+                                            let es_alerta = descripcion_alerta.is_some();
 
-                                        // Verificar si el equipo es Uso Interno
-                                        let descripcion_alerta = es_uso_interno(&conn, &lectura.epc);
-                                        let es_alerta = descripcion_alerta.is_some();
+                                            conn.execute(
+                                                "INSERT INTO LecturasRFID_Salidas (EPC, Antena, FechaLectura, Alerta)
+                                                VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), ?3)",
+                                                params![lectura.epc, lectura.antena as i32, es_alerta as i32],
+                                            ).ok();
 
-                                        // Guardar en tabla de salidas
-                                        conn.execute(
-                                            "INSERT INTO LecturasRFID_Salidas (EPC, Antena, FechaLectura, Alerta)
-                                             VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), ?3)", 
-                                            params![lectura.epc, lectura.antena as i32, es_alerta as i32],
-                                        ).ok();
+                                            (es_alerta, descripcion_alerta)
+                                        };
 
-                                        (es_alerta, descripcion_alerta)
-                                    }; // ← conn se libera aquí automáticamente
-
-                                        // Guardar en SQL Server (todos, con o sin alerta)
+                                        // Guardar en SQL Server
                                         guardar_salida_server(
                                             lectura.epc.clone(),
                                             lectura.antena,
                                             es_alerta
                                         ).await;
+
                                         if es_alerta {
                                             let descripcion = descripcion_alerta.unwrap();
                                             println!("🚨 ALERTA USO INTERNO: {} — {}", lectura.epc, descripcion);
                                             app.emit("alerta_uso_interno", &lectura.epc).unwrap();
 
-                                            // Obtener destinatarios de SQLite y enviar email
+                                            // ── Activar relay usando el mismo stream ──────────
+                                            // Pausar inventario antes de usar el stream para GPIO
+                                            stream.write_all(&build_command(0x8C, &[])).await.ok(); // stop inventario
+                                            tokio::time::sleep(Duration::from_millis(100)).await;
+
+                                            relay_on(&mut stream).await.ok();
+                                            tokio::time::sleep(Duration::from_secs(5)).await;
+                                            relay_off(&mut stream).await.ok();
+                                            tokio::time::sleep(Duration::from_millis(100)).await;
+
+                                            // Reanudar inventario
+                                            stream.write_all(&build_command(0x82, &[0x00, 0x00])).await.ok();
+
+                                            // Enviar email en hilo separado
                                             let correos: Vec<String> = {
                                                 let conn = db_state.0.lock().unwrap();
                                                 let mut stmt = conn.prepare(
@@ -888,7 +919,6 @@ async fn iniciar_lectura(
                                             let epc_clone  = lectura.epc.clone();
                                             let desc_clone = descripcion.clone();
 
-                                            // Enviar en hilo separado para no bloquear la lectura RFID
                                             tokio::task::spawn_blocking(move || {
                                                 enviar_email_alerta(correos, &epc_clone, &desc_clone);
                                             });
@@ -897,7 +927,7 @@ async fn iniciar_lectura(
                                         app.emit("tag_salida", &lectura.epc).unwrap();
 
                                     } else {
-                                        // ── Antena 1 y otras: inventario general ─────
+                                        // ── Antena 1 y otras: inventario general ─────────────
                                         batch_buffer.push((lectura.epc.clone(), lectura.antena));
 
                                         if batch_buffer.len() >= 30 || ultimo_flush.elapsed() >= Duration::from_secs(3) {
