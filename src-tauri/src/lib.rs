@@ -950,6 +950,7 @@ async fn iniciar_lectura(
                                 if payload_end > 5 {
                                     let payload = buffer[5..payload_end].to_vec();
                                     if let Some((epc, antena)) = extraer_epc_universal(&payload) {
+                                       // println!("🏷️ EPC: '{}' | Antena: {}", epc, antena);
                                         let now = Instant::now();
                                         
                                         let debe_procesar = {
@@ -984,63 +985,106 @@ async fn iniciar_lectura(
                                         app.emit("contador_total", &total_lecturas).unwrap();
                                         
                                         if antena == 2 {
-                                            let procesar = {
-                                                let mut salidas = last_seen_salidas.lock().await;
-                                                if let Some(&last_salida) = salidas.get(&epc) {
-                                                    if now.duration_since(last_salida) < Duration::from_secs(5) {
-                                                        false
+                                            // let procesar = {
+                                            //     let mut salidas = last_seen_salidas.lock().await;
+                                            //     if let Some(&last_salida) = salidas.get(&epc) {
+                                            //         if now.duration_since(last_salida) < Duration::from_secs(5) {
+                                            //             false
+                                            //         } else {
+                                            //             salidas.insert(epc.clone(), now);
+                                            //             true
+                                            //         }
+                                            //     } else {
+                                            //         salidas.insert(epc.clone(), now);
+                                            //         true
+                                            //     }
+                                            // };
+                                            
+                                            let relay_locks_clone_inner = relay_locks.clone();
+                                            let app_clone_inner = app.clone();
+                                            let db_clone_inner = db_state.0.clone();
+                                            let epc_clone = epc.clone();
+                                            let reconnect_tx_clone = reconnect_tx.clone();
+                                            let last_seen_salidas_clone = last_seen_salidas.clone();
+
+                                            tokio::spawn(async move {
+                                                println!("🚀 SPAWN iniciado para EPC: '{}'", epc_clone);
+                                                // PASO 1: Adquirir el lock PRIMERO, antes de cualquier otra cosa
+                                                let tag_lock = {
+                                                    let mut locks = relay_locks_clone_inner.lock().await;
+                                                    locks.entry(epc_clone.clone())
+                                                        .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+                                                        .clone()
+                                                };
+
+                                                // PASO 2: Intentar "cerrar la puerta" atomicamente
+                                                // Si ya esta cerrada (otro task llego primero), salir
+                                                if tag_lock.compare_exchange(
+                                                    false, true,
+                                                    Ordering::SeqCst, Ordering::SeqCst
+                                                ).is_err() {
+                                                    println!("🔒 Lock ya tomado, saliendo para: '{}'", epc_clone);
+                                                    return; // otro task ya tiene el lock → salir
+                                                }
+
+                                                println!("✅ Lock adquirido para: '{}'", epc_clone);
+
+                                                // PASO 3: Ahora sí verificar el debounce de 5 segundos
+                                                // Solo UNA task llega aqui
+                                                let now = Instant::now();
+                                                let debe_procesar_salida = {
+                                                    let mut salidas = last_seen_salidas_clone.lock().await;
+                                                    if let Some(&last) = salidas.get(&epc_clone) {
+                                                        if now.duration_since(last) < Duration::from_secs(5) {
+                                                            false // dentro del cooldown de 5s
+                                                        } else {
+                                                            salidas.insert(epc_clone.clone(), now);
+                                                            true
+                                                        }
                                                     } else {
-                                                        salidas.insert(epc.clone(), now);
+                                                        salidas.insert(epc_clone.clone(), now);
                                                         true
                                                     }
-                                                } else {
-                                                    salidas.insert(epc.clone(), now);
-                                                    true
-                                                }
-                                            };
-                                            
-                                            if procesar {
-                                                let relay_locks_clone_inner = relay_locks.clone();
-                                                let app_clone_inner = app.clone();
-                                                let db_clone_inner = db_state.0.clone();
-                                                let epc_clone = epc.clone();
-                                                let reconnect_tx_clone = reconnect_tx.clone();
-                                                
-                                                tokio::spawn(async move {
-                                                    let tag_lock = {
-                                                        let mut locks = relay_locks_clone_inner.lock().await;
-                                                        locks.entry(epc_clone.clone())
-                                                            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
-                                                            .clone()
-                                                    };
-                                                    if tag_lock.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
-                                                        return;
-                                                    }
-                                                    let es_alerta = {
-                                                        let conn = db_clone_inner.lock().unwrap();
-                                                        let desc = es_uso_interno(&conn, &epc_clone);
-                                                        let alerta = desc.is_some();
-                                                        let _ = conn.execute(
-                                                            "INSERT INTO LecturasRFID_Salidas (EPC, Antena, FechaLectura, Alerta)
-                                                             VALUES (?1, 2, datetime('now'), ?2)",
-                                                            params![&epc_clone, alerta as i32],
-                                                        );
-                                                        alerta
-                                                    };
-                                                    if es_alerta {
-                                                        app_clone_inner.emit("alerta_uso_interno", &epc_clone).unwrap();
-                                                        relay_on().await;
-                                                        tokio::time::sleep(Duration::from_secs(5)).await;
-                                                        relay_off().await;
-                                                        
-                                                        // Señalar al loop principal que debe reactivar el inventario
-                                                        tokio::time::sleep(Duration::from_millis(100)).await;
-                                                        let _ = reconnect_tx_clone.try_send(());
-                                                    }
-                                                    tokio::time::sleep(Duration::from_secs(10)).await;
+                                                };
+                                                println!("📋 debe_procesar_salida: {} para '{}'", debe_procesar_salida, epc_clone);
+
+                                                if !debe_procesar_salida {
+                                                    // Liberar el lock si no vamos a procesar
                                                     tag_lock.store(false, Ordering::SeqCst);
-                                                });
-                                            }
+                                                    return;
+                                                }
+
+                                                // PASO 4: Logica de alerta (igual que antes)
+                                                let es_alerta = {
+                                                    let conn = db_clone_inner.lock().unwrap();
+                                                    let desc = es_uso_interno(&conn, &epc_clone);
+                                                    println!("🔍 es_uso_interno para '{}': {:?}", epc_clone, desc);
+                                                    let alerta = desc.is_some();
+                                                    let _ = conn.execute(
+                                                        "INSERT INTO LecturasRFID_Salidas
+                                                        (EPC, Antena, FechaLectura, Alerta)
+                                                        VALUES (?1, 2, datetime('now'), ?2)",
+                                                        params![&epc_clone, alerta as i32],
+                                                    );
+                                                    alerta
+                                                };
+
+                                                println!("🚨 es_alerta: {} para '{}'", es_alerta, epc_clone);
+
+
+                                                if es_alerta {
+                                                    app_clone_inner.emit("alerta_uso_interno", &epc_clone).unwrap();
+                                                    //  relay_on().await;
+                                                    //  tokio::time::sleep(Duration::from_secs(5)).await;
+                                                    //  relay_off().await;
+                                                    //  tokio::time::sleep(Duration::from_millis(100)).await;
+                                                    //  let _ = reconnect_tx_clone.try_send(());
+                                                }
+
+                                                // Mantener el lock 10s y luego liberar
+                                                tokio::time::sleep(Duration::from_secs(10)).await;
+                                                tag_lock.store(false, Ordering::SeqCst);
+                                            });
                                         } else {
                                             let _ = tx.try_send((epc, antena));
                                         }
