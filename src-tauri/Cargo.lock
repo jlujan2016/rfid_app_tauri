@@ -3130,6 +3130,7 @@ dependencies = [
  "lettre",
  "md5",
  "rusqlite",
+ "scopeguard",
  "serde",
  "serde_json",
  "tauri",
