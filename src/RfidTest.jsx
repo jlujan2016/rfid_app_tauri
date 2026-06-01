@@ -164,7 +164,9 @@ const intervalo = setInterval(() => {
         lastTime.current = Date.now();
         try {
             await invoke("iniciar_lectura");
+            await new Promise(resolve => setTimeout(resolve, 500)); 
         } catch (error) {
+            console.error("Error iniciando lectura:", error);
             setEstado("error: " + error);
             setLeyendo(false);
         }

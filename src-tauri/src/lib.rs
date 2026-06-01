@@ -822,6 +822,12 @@ fn enviar_email_alerta(
     }
 }
 
+#[derive(Debug)]
+enum StreamCmd {
+    Reconectar,
+    RelayOn,
+    RelayOff,
+}
 // ─── COMANDO INICIAR LECTURA RFID (VERSIÓN DEFINITIVA) ─────────────────────────
 #[tauri::command]
 async fn iniciar_lectura(
@@ -831,11 +837,15 @@ async fn iniciar_lectura(
 ) -> Result<(), String> {
     {
         let mut activo = rfid_state.0.lock().unwrap();
+        println!("🔍 Estado actual rfid_state: {}", *activo);
         if *activo {
             return Err("El lector ya está activo".to_string());
         }
         *activo = true;
     }
+
+        // Dar tiempo a que cualquier loop anterior termine
+    tokio::time::sleep(Duration::from_millis(300)).await;
     
     let db_state_clone = db_state.0.clone();
     
@@ -886,7 +896,7 @@ async fn iniciar_lectura(
     println!("📡 Inventario continuo activo");
     
     // Canal para señalar reconexión desde el relay
-    let (reconnect_tx, mut reconnect_rx) = tokio::sync::mpsc::channel::<()>(10);
+    let (reconnect_tx, mut reconnect_rx) = tokio::sync::mpsc::channel::<StreamCmd>(100);
     
     while *rfid_state.0.lock().unwrap() {
         if cleanup_counter % 1000 == 0 {
@@ -907,30 +917,50 @@ async fn iniciar_lectura(
         
         tokio::select! {
             // Señal de reconexión desde el relay
-            _ = reconnect_rx.recv() => {
-                println!("🔄 Relay solicitó reconexión, reactivando inventario...");
-                buffer.clear();
-                
-                if let Err(e) = forzar_reactivacion_completa(&mut stream).await {
-                    println!("⚠️ Error reactivando: {}, reconectando completamente...", e);
-                    match conectar_lector().await {
-                        Ok(new_stream) => {
-                            stream = new_stream;
-                            println!("✅ Reconectado");
-                        }
-                        Err(recon_e) => {
-                            println!("❌ Error reconexión: {}", recon_e);
-                            tokio::time::sleep(Duration::from_secs(2)).await;
-                        }
+// DESPUÉS
+            Some(cmd) = reconnect_rx.recv() => {
+                match cmd {
+                    StreamCmd::RelayOn => {
+                        println!("🔓 RELAY ON (por stream principal)");
+                        let data = [0x09u8, 0x00, 0x00, 0x01];
+                        let _ = stream.write_all(&build_command(0xA1, &data)).await;
                     }
-                } else {
-                    println!("✅ Inventario reactivado exitosamente");
+                    StreamCmd::RelayOff => {
+                        println!("🔒 RELAY OFF (por stream principal)");
+                        let data = [0x09u8, 0x00, 0x00, 0x00];
+                        let _ = stream.write_all(&build_command(0xA1, &data)).await;
+                    }
+StreamCmd::Reconectar => {
+    println!("🔄 RECONECTAR recibido");
+    println!("🔄 Apagando relay y reactivando inventario...");
+
+    // PASO 1: Detener inventario
+    let _ = stream.write_all(&build_command(0x8C, &[])).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // PASO 1: Apagar relay
+    let data_off = [0x09u8, 0x00, 0x00, 0x00];
+    let _ = stream.write_all(&build_command(0xA1, &data_off)).await;
+    println!("🔒 RELAY OFF enviado");
+    
+    // PASO 2: Esperar bastante más — que el hardware procese el OFF
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    
+    // PASO 3: Reiniciar inventario
+    buffer.clear();
+    let _ = stream.write_all(&build_command(0x93, &[30])).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let _ = stream.write_all(&build_command(0x82, &[0x00, 0x00])).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    
+    println!("✅ Relay OFF + inventario reactivado");
+    app.emit("rfid_estado", "conectado").unwrap();
+}
                 }
-                app.emit("rfid_estado", "conectado").unwrap();
             }
             
             // Lectura normal del socket
-            result = tokio::time::timeout(Duration::from_millis(100), stream.read(&mut temp)) => {
+            result = tokio::time::timeout(Duration::from_millis(10), stream.read(&mut temp)) => {
                 match result {
                     Ok(Ok(n)) if n > 0 => {
                         buffer.extend_from_slice(&temp[..n]);
@@ -1072,14 +1102,30 @@ async fn iniciar_lectura(
                                                 println!("🚨 es_alerta: {} para '{}'", es_alerta, epc_clone);
 
 
-                                                if es_alerta {
-                                                    app_clone_inner.emit("alerta_uso_interno", &epc_clone).unwrap();
-                                                    //  relay_on().await;
-                                                    //  tokio::time::sleep(Duration::from_secs(5)).await;
-                                                    //  relay_off().await;
-                                                    //  tokio::time::sleep(Duration::from_millis(100)).await;
-                                                    //  let _ = reconnect_tx_clone.try_send(());
-                                                }
+if es_alerta {
+    app_clone_inner.emit("alerta_uso_interno", &epc_clone).unwrap();
+    let _ = reconnect_tx_clone.try_send(StreamCmd::RelayOn);
+    
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    
+    // Reintentar con try_send hasta que el canal tenga espacio
+    let mut enviado = false;
+    for intento in 0..50 {
+        match reconnect_tx_clone.try_send(StreamCmd::Reconectar) {
+            Ok(_) => {
+                println!("📨 Reconectar enviado en intento {}", intento + 1);
+                enviado = true;
+                break;
+            }
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+    if !enviado {
+        println!("❌ No se pudo enviar Reconectar después de 50 intentos");
+    }
+}
 
                                                 // Mantener el lock 10s y luego liberar
                                                 tokio::time::sleep(Duration::from_secs(10)).await;
