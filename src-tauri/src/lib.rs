@@ -76,7 +76,7 @@ async fn inicializar_lector(stream: &mut TcpStream) -> Result<(), String> {
 
 // ─── CONEXIÓN DEL LECTOR ──────────────────────────────────────────────────────
 async fn conectar_lector() -> Result<TcpStream, String> {
-    let mut stream = TcpStream::connect("192.168.100.180:5002")
+    let mut stream = TcpStream::connect("192.168.1.180:5002")
         .await
         .map_err(|e| format!("Error conectando: {}", e))?;
     
@@ -1105,7 +1105,45 @@ StreamCmd::Reconectar => {
 if es_alerta {
     app_clone_inner.emit("alerta_uso_interno", &epc_clone).unwrap();
     let _ = reconnect_tx_clone.try_send(StreamCmd::RelayOn);
-    
+
+    // ── ENVÍO DE EMAIL ──────────────────────────────────────────
+    // Obtener destinatarios y descripción desde SQLite
+    let (destinatarios_correos, descripcion) = {
+        let conn = db_clone_inner.lock().unwrap();
+
+        // Descripción del equipo
+        let desc = conn.query_row(
+            "SELECT DESCRIPCION FROM EQUIPOS_GLEF WHERE CODIGO_RFID = ?1",
+            params![&epc_clone],
+            |row| row.get::<_, String>(0),
+        ).unwrap_or_else(|_| "Equipo desconocido".to_string());
+
+        // Correos activos
+        let mut stmt = conn.prepare(
+            "SELECT correo FROM destinatarios_alerta WHERE activo = 1"
+        ).unwrap();
+        let correos: Vec<String> = stmt.query_map([], |row| {
+            row.get::<_, String>(0)
+        })
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
+
+        (correos, desc)
+    };
+
+    if !destinatarios_correos.is_empty() {
+        let epc_email = epc_clone.clone();
+        let desc_email = descripcion.clone();
+        // spawn_blocking porque lettre es síncrono
+        tokio::task::spawn_blocking(move || {
+            enviar_email_alerta(destinatarios_correos, &epc_email, &desc_email);
+        });
+    } else {
+        println!("⚠️ Sin destinatarios configurados para alerta de {}", epc_clone);
+    }
+    // ────────────────────────────────────────────────────────────
+
     tokio::time::sleep(Duration::from_secs(5)).await;
     
     // Reintentar con try_send hasta que el canal tenga espacio

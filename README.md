@@ -21,6 +21,8 @@ npm install
 npm run tauri build
 ### Android
 cargo tauri android build
+o 
+npm run tauri android dev
 
 # 📱 RFID App Tauri - Guía de Firmado para Android
 
