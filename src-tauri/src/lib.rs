@@ -76,7 +76,7 @@ async fn inicializar_lector(stream: &mut TcpStream) -> Result<(), String> {
 
 // ─── CONEXIÓN DEL LECTOR ──────────────────────────────────────────────────────
 async fn conectar_lector() -> Result<TcpStream, String> {
-    let mut stream = TcpStream::connect("192.168.1.180:5002")
+    let mut stream = TcpStream::connect("192.168.100.180:5002")
         .await
         .map_err(|e| format!("Error conectando: {}", e))?;
     
@@ -1012,6 +1012,7 @@ StreamCmd::Reconectar => {
                                             stats_timer = Instant::now();
                                         }
                                         app.emit("tag_leido", &epc).unwrap();
+                                        app.emit("tag_leido_detalle", serde_json::json!({ "epc": epc, "antena": antena })).unwrap();
                                         app.emit("contador_total", &total_lecturas).unwrap();
                                         
                                         if antena == 2 {
@@ -1137,7 +1138,7 @@ if es_alerta {
         let desc_email = descripcion.clone();
         // spawn_blocking porque lettre es síncrono
         tokio::task::spawn_blocking(move || {
-            enviar_email_alerta(destinatarios_correos, &epc_email, &desc_email);
+            //enviar_email_alerta(destinatarios_correos, &epc_email, &desc_email);
         });
     } else {
         println!("⚠️ Sin destinatarios configurados para alerta de {}", epc_clone);
@@ -1285,8 +1286,35 @@ pub fn run() {
             sincronizar_rfid_manual,
             iniciar_lectura,
             detener_lectura,
-            activar_relay_manual
+            activar_relay_manual,
+            obtener_equipos 
         ])
         .run(tauri::generate_context!())
         .expect("Error iniciando Tauri");
+}
+
+#[tauri::command]
+async fn obtener_equipos(db_state: State<'_, DbState>) -> Result<Vec<serde_json::Value>, String> {
+    let conn = db_state.0.lock().unwrap();
+    let mut stmt = conn.prepare(
+        "SELECT CODIGO_RFID, DESCRIPCION, CATEGORIA, TIPO_PRODUCTO, ESTADO, MARCA, MODELO
+         FROM EQUIPOS_GLEF ORDER BY CATEGORIA, DESCRIPCION"
+    ).map_err(|e| e.to_string())?;
+
+    let equipos: Vec<serde_json::Value> = stmt.query_map([], |row| {
+        Ok(serde_json::json!({
+            "epc":         row.get::<_, String>(0).unwrap_or_default(),
+            "descripcion": row.get::<_, String>(1).unwrap_or_default(),
+            "categoria":   row.get::<_, String>(2).unwrap_or_default(),
+            "tipo":        row.get::<_, String>(3).unwrap_or_default(),
+            "estado":      row.get::<_, String>(4).unwrap_or_default(),
+            "marca":       row.get::<_, String>(5).unwrap_or_default(),
+            "modelo":      row.get::<_, String>(6).unwrap_or_default(),
+        }))
+    })
+    .map_err(|e| e.to_string())?
+    .filter_map(|r| r.ok())
+    .collect();
+
+    Ok(equipos)
 }
