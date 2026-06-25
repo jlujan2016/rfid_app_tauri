@@ -47,13 +47,28 @@ function InventoryDashboard() {
   // Lógica Real de Escaneo RFID
   useEffect(() => {
     const unlistenTag = listen("tag_leido", (event) => {
-      const epc = event.payload;
+      const payload = event.payload;
+      
+      // Eliminado temporalmente el filtro de Antena 1 para que acepte cualquier lectura
+      // if (payload && payload.antena !== undefined && payload.antena !== 1) {
+      //   return; // Ignorar lecturas de la puerta (Antena 2)
+      // }
+
+      const epc = typeof payload === "string" ? payload : payload.epc;
+      const epc_ascii = payload && payload.epc_ascii ? String(payload.epc_ascii).trim().toLowerCase() : "";
       
       setInventory(prev => {
         let changed = false;
         const newInv = prev.map(item => {
-          // Si el código recibido de la antena coincide exactamente con el código_rfid de la base de datos
-          if (item.codigo_rfid === epc && item.status !== "found") {
+          // Normalizamos ambos códigos (minúsculas y sin espacios) para la comparación
+          const dbCode = item.codigo_rfid ? String(item.codigo_rfid).trim().toLowerCase() : "";
+          const scanCode = epc ? String(epc).trim().toLowerCase() : "";
+          
+          const matchHex = dbCode && scanCode && (scanCode.includes(dbCode) || dbCode.includes(scanCode));
+          const matchAscii = dbCode && epc_ascii && (epc_ascii.includes(dbCode) || dbCode.includes(epc_ascii));
+          const match = matchHex || matchAscii;
+
+          if (match && item.status !== "found") {
             changed = true;
             return { ...item, status: "found" };
           }
@@ -103,7 +118,7 @@ function InventoryDashboard() {
           }));
           setScanCount(0);
         }
-        await invoke("iniciar_lectura");
+        await invoke("iniciar_lectura", { antena: 0 }); // Pin 1
       } else {
         await invoke("detener_lectura");
       }

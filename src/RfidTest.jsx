@@ -37,39 +37,36 @@ function RfidTest() {
   const contadorSegundo = useRef(0);
   const lastTime = useRef(Date.now());
 
-  // 🔥 ACTUALIZACIÓN INMEDIATA (sin throttle)
-  const actualizarTag = (epc) => {
-    const ahora = Date.now();
-    
-    // Contar lecturas/segundo
-    contadorSegundo.current++;
-    if (ahora - lastTime.current >= 1000) {
-      setLecturasPorSegundo(contadorSegundo.current);
-      contadorSegundo.current = 0;
-      lastTime.current = ahora;
-    }
-    
-    // Actualización DIRECTA del estado
-    setTags(prev => {
-      const newCount = (prev[epc]?.count || 0) + 1;
-      return {
-        ...prev,
-        [epc]: {
-          epc: epc,
-          count: newCount,
-          lastSeen: new Date().toLocaleTimeString(),
-        },
-      };
-    });
-    
-    setUltimoTag({ epc, timestamp: ahora });
-    playBeep();
-  };
-
   useEffect(() => {
-    // Listener para tags leídos
+    // Listener para tags leídos — lógica inline para evitar closures obsoletos
     const unlisten = listen("tag_leido", (event) => {
-      actualizarTag(event.payload);
+      const payload = event.payload;
+      const epc = typeof payload === "string" ? payload : payload.epc;
+      const ahora = Date.now();
+
+      // Contar lecturas/segundo usando refs (siempre actuales)
+      contadorSegundo.current++;
+      if (ahora - lastTime.current >= 1000) {
+        setLecturasPorSegundo(contadorSegundo.current);
+        contadorSegundo.current = 0;
+        lastTime.current = ahora;
+      }
+
+      // Actualización funcional: siempre trabaja con el estado más reciente
+      setTags(prev => {
+        const newCount = (prev[epc]?.count || 0) + 1;
+        return {
+          ...prev,
+          [epc]: {
+            epc: epc,
+            count: newCount,
+            lastSeen: new Date().toLocaleTimeString(),
+          },
+        };
+      });
+
+      setUltimoTag({ epc, timestamp: ahora });
+      playBeep();
     });
 
     // Listener para estado del lector
@@ -79,9 +76,10 @@ function RfidTest() {
       if (event.payload === "detenido") setLeyendo(false);
     });
 
-    // 🔥 NUEVO: Listener para contador total desde backend (opcional)
+    // Listener para contador total desde backend
     const unlistenContador = listen("contador_total", (event) => {
-      setContadorBackend(event.payload);
+      const payload = event.payload;
+      setContadorBackend(typeof payload === "number" ? payload : payload.total);
     });
 
     return () => {
@@ -99,7 +97,7 @@ function RfidTest() {
     contadorSegundo.current = 0;
     lastTime.current = Date.now();
     try {
-      await invoke("iniciar_lectura");
+      await invoke("iniciar_lectura", { antena: 0 });
     } catch (error) {
       setEstado("error: " + error);
       setLeyendo(false);
