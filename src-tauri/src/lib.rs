@@ -146,12 +146,62 @@ async fn relay_off() -> bool {
 // ════════════════════════════════════════════════════════════════════════════
 // ─── MÓDULO NVR: CAPTURA DE VIDEO EN ALERTAS RFID ─────────────────────────────
 // ════════════════════════════════════════════════════════════════════════════
+//
+// ⚠️  NOTA CRÍTICA SOBRE ZONA HORARIA — LEER ANTES DE TOCAR FECHAS ⚠️
+// ──────────────────────────────────────────────────────────────────────────
+// Este módulo toma el valor de `FechaLectura` (columna de LecturasRFID_Salidas)
+// TAL CUAL y lo usa directo como `starttime` para el NVR. NO se hace NINGUNA
+// conversión de zona horaria en este código — funciona solo porque, a fecha
+// de esta nota, AMBOS lados están alineados en el mismo huso horario:
+//
+//   - SQLite genera FechaLectura con: datetime('now', 'localtime')
+//     → guarda hora LOCAL Perú (UTC-5), NO UTC.
+//   - El NVR Hikvision (192.168.1.76), tras ajustar manualmente su reloj
+//     el 2026-06-25, quedó grabando con timestamps en hora LOCAL Perú
+//     también (verificado comparando el timestamp quemado en el video
+//     contra FechaLectura, y coincidieron con el margen de
+//     CLIP_MARGEN_ANTES=10s).
+//
+// ESTO NO ES EL COMPORTAMIENTO POR DEFECTO DE UN NVR HIKVISION.
+// Por diseño, estos equipos normalmente graban en UTC puro internamente,
+// sin importar el campo `timeZone` que se vea en /ISAPI/System/time (ese
+// campo es solo informativo/para el OSD). Lo confirmamos así al inicio del
+// proyecto: la imagen del DVR mostraba "15:00:08" cuando en Perú eran
+// las 10:00 AM — diferencia de 5h, o sea UTC real.
+//
+// SI EN EL FUTURO ALGO DEJA DE CUADRAR (el clip descargado no muestra el
+// evento, o aparece 5 horas antes/después de lo esperado), lo más probable
+// es que el NVR haya vuelto a su comportamiento UTC normal — por ejemplo
+// tras:
+//   - Un reinicio o corte de luz prolongado
+//   - Una actualización de firmware
+//   - Que alguien vuelva a tocar Configuración > Fecha y Hora en el NVR
+//   - Sincronización automática por NTP (si está habilitada)
+//
+// CÓMO DIAGNOSTICARLO RÁPIDO (mismos pasos que usamos para detectar esto):
+//   1. curl --digest -u admin:PASS http://IP/ISAPI/System/time
+//      → mirar <localTime> y compararlo con la hora real de tu reloj.
+//   2. Generar una alerta nueva, anotar el FechaLectura exacto del registro.
+//   3. Descargar/revisar el clip resultante y comparar el timestamp
+//      quemado en el video contra ese FechaLectura.
+//   4. Si difieren ~5 horas → el NVR volvió a UTC. Hay 2 soluciones:
+//        a) Re-ajustar el NVR para que vuelva a grabar en hora local, o
+//        b) Quitar 'localtime' del INSERT (volver a datetime('now') puro)
+//           y, si el NVR está en UTC, todo vuelve a alinearse sin tocar
+//           nada más de este módulo.
+//
+// EN RESUMEN: la regla de oro es que FechaLectura y el reloj de grabación
+// del NVR deben estar en el MISMO huso horario. Cuál de los dos sea
+// (UTC o local) no importa para que el sistema funcione — lo que rompe
+// todo es que estén DESALINEADOS entre sí.
+// ════════════════════════════════════════════════════════════════════════════
 // Usa las mismas variables .env que el resto de la app (GMAIL_USER, etc.)
 // Agrega estas líneas nuevas a tu .env existente:
 //   NVR_IP=
 //   NVR_USER=
 //   NVR_PASS=
 //   NVR_TRACK=101
+//   NVR_TRACKS=101,301,401,601,901
 //   CLIP_DURACION_SEGS=40
 //   CLIP_MARGEN_ANTES=10
 //   CLIP_DELAY_INICIAL_SEGS=480
@@ -168,8 +218,13 @@ fn nvr_user() -> String {
 fn nvr_pass() -> String {
     env::var("NVR_PASS").unwrap_or_default()
 }
-fn nvr_track() -> String {
-    env::var("NVR_TRACK").unwrap_or_else(|_| "101".to_string())
+fn nvr_tracks() -> Vec<String> {
+    env::var("NVR_TRACKS")
+        .unwrap_or_else(|_| "101".to_string())
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 fn clip_duracion_segs() -> u32 {
     env::var("CLIP_DURACION_SEGS").ok().and_then(|v| v.parse().ok()).unwrap_or(40)
@@ -199,7 +254,7 @@ fn obtener_clips_dir(app: &AppHandle) -> std::path::PathBuf {
 }
 
 // Buscar si el NVR ya tiene grabado el segmento de cierto momento (vía curl)
-async fn buscar_segmento_nvr(starttime_utc: &str) -> bool {
+async fn buscar_segmento_nvr(track: &str, starttime_utc: &str) -> bool {
     let dt = NaiveDateTime::parse_from_str(starttime_utc, "%Y-%m-%dT%H:%M:%S")
         .unwrap_or_else(|_| chrono::Utc::now().naive_utc());
     let endtime = (dt + chrono::Duration::minutes(2))
@@ -222,11 +277,11 @@ async fn buscar_segmento_nvr(starttime_utc: &str) -> bool {
   <maxResults>5</maxResults>
   <searchResultPostion>0</searchResultPostion>
 </CMSearchDescription>"#,
-        nvr_track(), starttime_utc, endtime
+        track, starttime_utc, endtime
     );
 
     let xml_path = std::env::temp_dir()
-        .join(format!("nvr_search_{}_{}.xml", std::process::id(), starttime_utc.replace(':', "")));
+        .join(format!("nvr_search_{}_{}_{}.xml", std::process::id(), track, starttime_utc.replace(':', "")));
     let _ = std::fs::remove_file(&xml_path);
 
     if let Err(e) = std::fs::write(&xml_path, xml.as_bytes()) {
@@ -258,18 +313,19 @@ async fn buscar_segmento_nvr(starttime_utc: &str) -> bool {
             let body = String::from_utf8_lossy(&out.stdout);
             let disponible = !body.contains("<numOfMatches>0</numOfMatches>")
                 && body.contains("<numOfMatches>");
-            println!("🔍 [NVR] Búsqueda starttime={} → disponible={}", starttime_utc, disponible);
+            println!("🔍 [NVR] Track={} starttime={} → disponible={}", track, starttime_utc, disponible);
             disponible
         }
         Err(e) => {
-            println!("❌ [NVR] Error ejecutando curl: {}", e);
+            println!("❌ [NVR] Error ejecutando curl (track={}): {}", track, e);
             false
         }
     }
 }
 
-// Descargar el clip exacto usando ffmpeg + RTSP playback
+// Descargar el clip exacto usando ffmpeg + RTSP playback, para un track específico
 async fn descargar_clip_nvr(
+    track: &str,
     evento_ts: NaiveDateTime,
     epc: &str,
     clips_dir: &std::path::Path,
@@ -282,17 +338,17 @@ async fn descargar_clip_nvr(
         .to_string();
 
     let epc_safe = epc.replace([':', ' '], "");
-    let filename = format!("clip_{}_{}.mp4", epc_safe, evento_ts.format("%Y%m%d_%H%M%S"));
+    let filename = format!("clip_cam{}_{}_{}.mp4", track, epc_safe, evento_ts.format("%Y%m%d_%H%M%S"));
     let filepath = clips_dir.join(&filename);
     let filepath_str = filepath.to_string_lossy().to_string();
 
     let rtsp_url = format!(
         "rtsp://{}:{}@{}/Streaming/tracks/{}/?starttime={}&endtime={}",
-        nvr_user(), nvr_pass(), nvr_ip(), nvr_track(),
+        nvr_user(), nvr_pass(), nvr_ip(), track,
         starttime_str, endtime_str
     );
 
-    println!("🎬 [NVR] Descargando clip: {}", filename);
+    println!("🎬 [NVR] Descargando clip cámara {}: {}", track, filename);
 
     let output = tokio::process::Command::new("ffmpeg")
         .args([
@@ -310,30 +366,31 @@ async fn descargar_clip_nvr(
 
     match output {
         Ok(out) if out.status.success() => {
-            println!("✅ [NVR] Clip guardado: {}", filepath_str);
+            println!("✅ [NVR] Clip cámara {} guardado: {}", track, filepath_str);
             Some(filepath_str)
         }
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
             let lines: Vec<&str> = stderr.lines().collect();
             let ultimas = lines.iter().rev().take(8).rev().cloned().collect::<Vec<_>>().join("\n");
-            println!("❌ [NVR] ffmpeg falló:\n{}", ultimas);
+            println!("❌ [NVR] ffmpeg falló (cámara {}):\n{}", track, ultimas);
             None
         }
         Err(e) => {
-            println!("❌ [NVR] Error ejecutando ffmpeg: {}", e);
+            println!("❌ [NVR] Error ejecutando ffmpeg (cámara {}): {}", track, e);
             None
         }
     }
 }
 
-// Tarea en background: espera el delay del NVR, busca el segmento con
-// reintentos, descarga el clip y guarda la ruta en SQLite. Al final
-// envía un SEGUNDO correo con el video adjunto.
+// Tarea en background: espera el delay del NVR, busca el segmento (en TODAS
+// las cámaras configuradas) con reintentos, descarga los clips encontrados
+// en paralelo y guarda las rutas en SQLite. Al final envía un SEGUNDO correo
+// con todos los videos disponibles adjuntos.
 async fn programar_descarga_video(
     salida_id: i64,
     epc: String,
-    fecha_lectura: String, // "YYYY-MM-DD HH:MM:SS" tal cual viene de SQLite (UTC)
+    fecha_lectura: String, // "YYYY-MM-DD HH:MM:SS" tal cual viene de SQLite
     descripcion: String,
     destinatarios: Vec<String>,
     db_state: Arc<Mutex<Connection>>,
@@ -347,65 +404,114 @@ async fn programar_descarga_video(
         }
     };
 
-    println!("⏳ [NVR] Salida ID={} EPC={} — esperando {}s antes de buscar segmento...",
-        salida_id, epc, clip_delay_inicial_segs());
+    let tracks = nvr_tracks();
+    println!("⏳ [NVR] Salida ID={} EPC={} — cámaras a capturar: {:?}", salida_id, epc, tracks);
+    println!("⏳ [NVR] Esperando {}s antes de buscar segmentos...", clip_delay_inicial_segs());
     tokio::time::sleep(Duration::from_secs(clip_delay_inicial_segs())).await;
 
     let starttime_search = evento_ts.format("%Y-%m-%dT%H:%M:%S").to_string();
-    let mut disponible = false;
+
+    // ── Buscar disponibilidad en cada cámara, con reintentos ──
+    // Una cámara puede estar disponible en el intento 1 y otra recién en el 3,
+    // así que reintentamos hasta clip_reintentos() veces, pero descargamos
+    // cada cámara en cuanto la encontramos disponible (no esperamos a las demás).
+    let mut tracks_disponibles: Vec<String> = Vec::new();
+    let mut tracks_pendientes: Vec<String> = tracks.clone();
 
     for intento in 1..=clip_reintentos() {
-        println!("🔍 [NVR] Intento {}/{} buscando segmento para salida ID={}",
-            intento, clip_reintentos(), salida_id);
-        if buscar_segmento_nvr(&starttime_search).await {
-            disponible = true;
+        if tracks_pendientes.is_empty() {
             break;
         }
-        if intento < clip_reintentos() {
+        println!("🔍 [NVR] Intento {}/{} — verificando cámaras: {:?}",
+            intento, clip_reintentos(), tracks_pendientes);
+
+        let mut siguen_pendientes = Vec::new();
+        for track in &tracks_pendientes {
+            if buscar_segmento_nvr(track, &starttime_search).await {
+                tracks_disponibles.push(track.clone());
+            } else {
+                siguen_pendientes.push(track.clone());
+            }
+        }
+        tracks_pendientes = siguen_pendientes;
+
+        if !tracks_pendientes.is_empty() && intento < clip_reintentos() {
             tokio::time::sleep(Duration::from_secs(clip_intervalo_reintento_segs())).await;
         }
     }
 
-    if !disponible {
-        println!("❌ [NVR] Segmento no disponible tras {} intentos (salida ID={})",
+    if tracks_disponibles.is_empty() {
+        println!("❌ [NVR] Ninguna cámara tuvo segmento disponible tras {} intentos (salida ID={})",
             clip_reintentos(), salida_id);
         return;
     }
 
+    if !tracks_pendientes.is_empty() {
+        println!("⚠️ [NVR] Cámaras sin segmento disponible (se omiten): {:?}", tracks_pendientes);
+    }
+
+    // ── Descargar en paralelo todas las cámaras que sí tuvieron segmento ──
     let clips_dir = obtener_clips_dir(&app);
-    if let Some(clip_path) = descargar_clip_nvr(evento_ts, &epc, &clips_dir).await {
-        {
-            let conn = db_state.lock().unwrap();
-            if let Err(e) = conn.execute(
-                "UPDATE LecturasRFID_Salidas SET video_clip = ?1 WHERE Id = ?2",
-                params![clip_path, salida_id],
-            ) {
-                println!("❌ [NVR] Error guardando video_clip en BD: {}", e);
-                return;
-            }
-        }
-        println!("💾 [NVR] video_clip guardado en BD para salida ID={}: {}", salida_id, clip_path);
+    let mut descargas = Vec::new();
+    for track in &tracks_disponibles {
+        let track = track.clone();
+        let clips_dir = clips_dir.clone();
+        let epc_clone = epc.clone();
+        descargas.push(async move {
+            let ruta = descargar_clip_nvr(&track, evento_ts, &epc_clone, &clips_dir).await;
+            (track, ruta)
+        });
+    }
+    let resultados = futures::future::join_all(descargas).await;
 
-        let _ = app.emit("video_clip_listo", serde_json::json!({
-            "salida_id": salida_id,
-            "epc": epc,
-            "clip": clip_path
-        }));
+    let clips_exitosos: Vec<(String, String)> = resultados
+        .into_iter()
+        .filter_map(|(track, ruta)| ruta.map(|r| (track, r)))
+        .collect();
 
-        // ── Segundo correo: ahora con el video adjunto ──
-        if !destinatarios.is_empty() {
-            let clip_path_clone = clip_path.clone();
-            let epc_clone = epc.clone();
-            let descripcion_clone = descripcion.clone();
-            tokio::task::spawn_blocking(move || {
-                enviar_email_alerta_con_video(
-                    destinatarios,
-                    &epc_clone,
-                    &descripcion_clone,
-                    Some(&clip_path_clone),
-                );
-            });
+    if clips_exitosos.is_empty() {
+        println!("❌ [NVR] Ninguna descarga de ffmpeg tuvo éxito (salida ID={})", salida_id);
+        return;
+    }
+
+    // ── Guardar todas las rutas en SQLite (separadas por ';') ──
+    let rutas_concatenadas = clips_exitosos
+        .iter()
+        .map(|(_, ruta)| ruta.as_str())
+        .collect::<Vec<_>>()
+        .join(";");
+
+    {
+        let conn = db_state.lock().unwrap();
+        if let Err(e) = conn.execute(
+            "UPDATE LecturasRFID_Salidas SET video_clip = ?1 WHERE Id = ?2",
+            params![rutas_concatenadas, salida_id],
+        ) {
+            println!("❌ [NVR] Error guardando video_clip en BD: {}", e);
+        } else {
+            println!("💾 [NVR] {} clip(s) guardados en BD para salida ID={}", clips_exitosos.len(), salida_id);
         }
+    }
+
+    let _ = app.emit("video_clip_listo", serde_json::json!({
+        "salida_id": salida_id,
+        "epc": epc,
+        "clips": clips_exitosos.iter().map(|(t, r)| serde_json::json!({"camara": t, "ruta": r})).collect::<Vec<_>>()
+    }));
+
+    // ── Segundo correo: con todos los videos adjuntos ──
+    if !destinatarios.is_empty() {
+        let rutas: Vec<String> = clips_exitosos.iter().map(|(_, r)| r.clone()).collect();
+        let epc_clone = epc.clone();
+        let descripcion_clone = descripcion.clone();
+        tokio::task::spawn_blocking(move || {
+            enviar_email_alerta_con_videos(
+                destinatarios,
+                &epc_clone,
+                &descripcion_clone,
+                &rutas,
+            );
+        });
     }
 }
 
@@ -1034,6 +1140,102 @@ fn enviar_email_alerta(
     enviar_email_alerta_con_video(destinatarios, epc, descripcion, None);
 }
 
+// ─── ENVIAR EMAIL CON MÚLTIPLES VIDEOS ADJUNTOS (varias cámaras) ─────────────
+fn enviar_email_alerta_con_videos(
+    destinatarios: Vec<String>,
+    epc: &str,
+    descripcion: &str,
+    clip_paths: &[String],
+) {
+    use lettre::{
+        Message, SmtpTransport, Transport,
+        message::{header::ContentType, Attachment, MultiPart, SinglePart},
+        transport::smtp::authentication::Credentials,
+    };
+
+    let gmail_user = match env::var("GMAIL_USER") {
+        Ok(v) => v,
+        Err(_) => {
+            println!("❌ GMAIL_USER no configurado en .env");
+            return;
+        }
+    };
+    let gmail_pass = match env::var("GMAIL_PASS") {
+        Ok(v) => v,
+        Err(_) => {
+            println!("❌ GMAIL_PASS no configurado en .env");
+            return;
+        }
+    };
+
+    let creds = Credentials::new(gmail_user.clone(), gmail_pass);
+
+    let mailer = match SmtpTransport::relay("smtp.gmail.com") {
+        Ok(m) => m.credentials(creds).build(),
+        Err(e) => {
+            println!("❌ Error configurando SMTP: {}", e);
+            return;
+        }
+    };
+
+    let asunto = format!("🎬 VIDEO ({} cámara/s): Captura de alerta de uso interno", clip_paths.len());
+
+    let cuerpo = format!(
+        "Se detectó un equipo de uso interno intentando salir.\n\n\
+         EPC      : {}\n\
+         Equipo   : {}\n\
+         Fecha    : {}\n\n\
+         Se adjuntan {} video(s) de las cámaras correspondientes al momento del evento.",
+        epc,
+        descripcion,
+        chrono::Local::now().format("%d/%m/%Y %H:%M:%S"),
+        clip_paths.len(),
+    );
+
+    for correo in &destinatarios {
+        let mut multipart = MultiPart::mixed().singlepart(
+            SinglePart::builder()
+                .header(ContentType::TEXT_PLAIN)
+                .body(cuerpo.clone())
+        );
+
+        let mut adjuntos_ok = 0;
+        for path in clip_paths {
+            match std::fs::read(path) {
+                Ok(video_bytes) => {
+                    let filename = std::path::Path::new(path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "clip.mp4".to_string());
+
+                    let attachment = Attachment::new(filename)
+                        .body(video_bytes, "video/mp4".parse().unwrap());
+
+                    multipart = multipart.singlepart(attachment);
+                    adjuntos_ok += 1;
+                }
+                Err(e) => {
+                    println!("⚠️ No se pudo leer el clip ({}): {}", path, e);
+                }
+            }
+        }
+
+        let email = Message::builder()
+            .from(gmail_user.parse().unwrap())
+            .to(correo.parse().unwrap())
+            .subject(&asunto)
+            .multipart(multipart);
+
+        match email {
+            Ok(e) => match mailer.send(&e) {
+                Ok(_) => println!("📧 Email con {} video(s) enviado a: {}", adjuntos_ok, correo),
+                Err(e) => println!("❌ Error enviando a {}: {}", correo, e),
+            },
+            Err(e) => println!("❌ Error construyendo email: {}", e),
+        }
+    }
+}
+
 // ─── ENVIAR EMAIL DE ALERTA, CON SOPORTE OPCIONAL DE VIDEO ADJUNTO ───────────
 // Si clip_path es Some(ruta), adjunta el video. Si es None, manda solo texto
 // (se usa para el primer correo inmediato, antes de que el clip exista).
@@ -1173,7 +1375,7 @@ async fn iniciar_lectura(
         *activo = true;
     }
 
-    // Dar tiempo a que cualquier loop anterior termine
+     // Dar tiempo a que cualquier loop anterior termine
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let db_state_clone = db_state.0.clone();
@@ -1224,7 +1426,7 @@ async fn iniciar_lectura(
     app.emit("rfid_estado", "conectado").unwrap();
     println!("📡 Inventario continuo activo");
 
-    // Canal para señalar reconexión desde el relay
+     // Canal para señalar reconexión desde el relay
     let (reconnect_tx, mut reconnect_rx) = tokio::sync::mpsc::channel::<StreamCmd>(100);
 
     while *rfid_state.0.lock().unwrap() {
@@ -1287,8 +1489,8 @@ async fn iniciar_lectura(
                     }
                 }
             }
-
-             // Lectura normal del socket
+        
+            // Lectura normal del socket
             result = tokio::time::timeout(Duration::from_millis(10), stream.read(&mut temp)) => {
                 match result {
                     Ok(Ok(n)) if n > 0 => {
@@ -1404,6 +1606,9 @@ async fn iniciar_lectura(
                                                     let desc = es_uso_interno(&conn, &epc_clone);
                                                     println!("🔍 es_uso_interno para '{}': {:?}", epc_clone, desc);
                                                     let alerta = desc.is_some();
+                                                    // ⚠️ 'localtime' aquí asume que el NVR también graba en
+                                                    // hora LOCAL Perú (no UTC). Ver nota completa al inicio
+                                                    // del módulo NVR si algún clip sale desalineado ~5 horas.
                                                     let _ = conn.execute(
                                                         "INSERT INTO LecturasRFID_Salidas
                                                         (EPC, Antena, FechaLectura, Alerta)
@@ -1439,7 +1644,7 @@ async fn iniciar_lectura(
                                                             params![&epc_clone],
                                                             |row| row.get::<_, String>(0),
                                                         ).unwrap_or_else(|_| "Equipo desconocido".to_string());
-
+                                                        
                                                         // Correos activos
                                                         let mut stmt = conn.prepare(
                                                             "SELECT correo FROM destinatarios_alerta WHERE activo = 1"
@@ -1487,7 +1692,7 @@ async fn iniciar_lectura(
                                                         println!("⚠️ [NVR] No se pudo obtener salida_id para EPC={}", epc_clone);
                                                     }
                                                     // ── FIN NUEVO ──
-                                        
+
                                                     // ───────────────────────────────────────────────────────
                                                     tokio::time::sleep(Duration::from_secs(5)).await;
 
@@ -1581,7 +1786,7 @@ pub fn run() {
                 .expect("Error obteniendo app_data_dir")
                 .join("app.db");
 
-            println!("📂 Base de datos local SQLite en: {:?}", db_path);
+                        println!("📂 Base de datos local SQLite en: {:?}", db_path);
             //Windows
            // C:\\Users\\lujan\\AppData\\Roaming\\com.lujan.rfid-app-tauri\\app.db
             std::fs::create_dir_all(db_path.parent().unwrap())
