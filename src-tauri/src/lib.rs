@@ -1581,7 +1581,7 @@ async fn iniciar_lectura(
                                                 let debe_procesar_salida = {
                                                     let mut salidas = last_seen_salidas_clone.lock().await;
                                                     if let Some(&last) = salidas.get(&epc_clone) {
-                                                        if now.duration_since(last) < Duration::from_secs(5) {
+                                                        if now.duration_since(last) < Duration::from_secs(60) {
                                                             false // dentro del cooldown de 5s
                                                         } else {
                                                             salidas.insert(epc_clone.clone(), now);
