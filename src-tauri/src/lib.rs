@@ -10,6 +10,7 @@ use tokio::net::TcpStream;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 use dotenvy::dotenv;
 use std::sync::atomic::{AtomicBool, Ordering};
+use chrono::NaiveDateTime; // ← NUEVO: requerido por el módulo NVR
 
 // ─── ESTADOS GLOBALES ─────────────────────────────────────────────────────────
 pub struct DbState(pub Arc<Mutex<Connection>>);
@@ -54,22 +55,22 @@ async fn inicializar_lector(stream: &mut TcpStream) -> Result<(), String> {
     println!("🔄 Soft reset...");
     stream.write_all(&build_command(0xA2, &[])).await.map_err(|e| e.to_string())?;
     tokio::time::sleep(Duration::from_millis(200)).await;
-    
+
     // 2. Apagar beep
     println!("🔇 Beep OFF...");
     stream.write_all(&build_command(0xA0, &[0x00])).await.map_err(|e| e.to_string())?;
     tokio::time::sleep(Duration::from_millis(50)).await;
-    
+
     // 3. Configurar potencia (30 dBm)
     println!("📡 Configurando potencia 30dBm...");
     stream.write_all(&build_command(0x93, &[30])).await.map_err(|e| e.to_string())?;
     tokio::time::sleep(Duration::from_millis(50)).await;
-    
+
     // 4. INICIAR INVENTARIO CONTINUO (respetando el modo actual del lector)
     println!("🚀 Iniciando inventario continuo...");
     stream.write_all(&build_command(0x82, &[0x00, 0x00])).await.map_err(|e| e.to_string())?;
     tokio::time::sleep(Duration::from_millis(100)).await;
-    
+
     println!("✅ Lector inicializado - Inventario continuo activo");
     Ok(())
 }
@@ -79,41 +80,41 @@ async fn conectar_lector() -> Result<TcpStream, String> {
     let mut stream = TcpStream::connect("192.168.1.180:5002")
         .await
         .map_err(|e| format!("Error conectando: {}", e))?;
-    
+
     stream.set_nodelay(true).map_err(|e| format!("Error set_nodelay: {}", e))?;
-    
+
     inicializar_lector(&mut stream).await?;
-    
+
     Ok(stream)
 }
 
 // ─── FORZAR REACTIVACIÓN COMPLETA DEL LECTOR ───────────────────────────────────
 async fn forzar_reactivacion_completa(stream: &mut TcpStream) -> Result<(), String> {
     println!("🔄 Forzando reactivación completa...");
-    
-    // Detener inventario
+
+     // Detener inventario
     let _ = stream.write_all(&build_command(0x8C, &[])).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
-    
+
     // Soft reset suave
     let _ = stream.write_all(&build_command(0xA2, &[])).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
-    
-    // Reconfigurar potencia
+
+     // Reconfigurar potencia
     let _ = stream.write_all(&build_command(0x93, &[30])).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
-    
+
     // Reiniciar inventario continuo
     stream.write_all(&build_command(0x82, &[0x00, 0x00])).await.map_err(|e| e.to_string())?;
     tokio::time::sleep(Duration::from_millis(100)).await;
-    
+
     println!("✅ Lector reactivado");
     Ok(())
 }
 
 // ─── CONTROL DEL RELAY (CONEXIONES INDEPENDIENTES) ────────────────────────────
 async fn relay_on() -> bool {
-    match TcpStream::connect("192.168.100.180:5002").await {
+    match TcpStream::connect("192.168.1.180:5002").await {
         Ok(mut s) => {
             let _ = s.set_nodelay(true);
             let _ = s.write_all(&build_command(0xA1, &[0x09, 0x00, 0x00, 0x01])).await;
@@ -128,7 +129,7 @@ async fn relay_on() -> bool {
 }
 
 async fn relay_off() -> bool {
-    match TcpStream::connect("192.168.100.180:5002").await {
+    match TcpStream::connect("192.168.1.180:5002").await {
         Ok(mut s) => {
             let _ = s.set_nodelay(true);
             let _ = s.write_all(&build_command(0xA1, &[0x09, 0x00, 0x00, 0x00])).await;
@@ -142,6 +143,274 @@ async fn relay_off() -> bool {
     }
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// ─── MÓDULO NVR: CAPTURA DE VIDEO EN ALERTAS RFID ─────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// Usa las mismas variables .env que el resto de la app (GMAIL_USER, etc.)
+// Agrega estas líneas nuevas a tu .env existente:
+//   NVR_IP=
+//   NVR_USER=
+//   NVR_PASS=
+//   NVR_TRACK=101
+//   CLIP_DURACION_SEGS=40
+//   CLIP_MARGEN_ANTES=10
+//   CLIP_DELAY_INICIAL_SEGS=480
+//   CLIP_REINTENTOS=5
+//   CLIP_INTERVALO_REINTENTO_SEGS=60
+// ════════════════════════════════════════════════════════════════════════════
+
+fn nvr_ip() -> String {
+    env::var("NVR_IP").unwrap_or_else(|_| "192.168.1.76".to_string())
+}
+fn nvr_user() -> String {
+    env::var("NVR_USER").unwrap_or_else(|_| "admin".to_string())
+}
+fn nvr_pass() -> String {
+    env::var("NVR_PASS").unwrap_or_default()
+}
+fn nvr_track() -> String {
+    env::var("NVR_TRACK").unwrap_or_else(|_| "101".to_string())
+}
+fn clip_duracion_segs() -> u32 {
+    env::var("CLIP_DURACION_SEGS").ok().and_then(|v| v.parse().ok()).unwrap_or(40)
+}
+fn clip_margen_antes() -> i64 {
+    env::var("CLIP_MARGEN_ANTES").ok().and_then(|v| v.parse().ok()).unwrap_or(10)
+}
+fn clip_delay_inicial_segs() -> u64 {
+    env::var("CLIP_DELAY_INICIAL_SEGS").ok().and_then(|v| v.parse().ok()).unwrap_or(480)
+}
+fn clip_reintentos() -> u32 {
+    env::var("CLIP_REINTENTOS").ok().and_then(|v| v.parse().ok()).unwrap_or(5)
+}
+fn clip_intervalo_reintento_segs() -> u64 {
+    env::var("CLIP_INTERVALO_REINTENTO_SEGS").ok().and_then(|v| v.parse().ok()).unwrap_or(60)
+}
+
+// Carpeta persistente donde se guardan los clips descargados
+fn obtener_clips_dir(app: &AppHandle) -> std::path::PathBuf {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .expect("Error obteniendo app_data_dir")
+        .join("clips_rfid");
+    std::fs::create_dir_all(&dir).ok();
+    dir
+}
+
+// Buscar si el NVR ya tiene grabado el segmento de cierto momento (vía curl)
+async fn buscar_segmento_nvr(starttime_utc: &str) -> bool {
+    let dt = NaiveDateTime::parse_from_str(starttime_utc, "%Y-%m-%dT%H:%M:%S")
+        .unwrap_or_else(|_| chrono::Utc::now().naive_utc());
+    let endtime = (dt + chrono::Duration::minutes(2))
+        .format("%Y-%m-%dT%H:%M:%S")
+        .to_string();
+
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<CMSearchDescription>
+  <searchID>11111111-2222-3333-4444-555555555555</searchID>
+  <trackIDList>
+    <trackID>{}</trackID>
+  </trackIDList>
+  <timeSpanList>
+    <timeSpan>
+      <startTime>{}</startTime>
+      <endTime>{}</endTime>
+    </timeSpan>
+  </timeSpanList>
+  <maxResults>5</maxResults>
+  <searchResultPostion>0</searchResultPostion>
+</CMSearchDescription>"#,
+        nvr_track(), starttime_utc, endtime
+    );
+
+    let xml_path = std::env::temp_dir()
+        .join(format!("nvr_search_{}_{}.xml", std::process::id(), starttime_utc.replace(':', "")));
+    let _ = std::fs::remove_file(&xml_path);
+
+    if let Err(e) = std::fs::write(&xml_path, xml.as_bytes()) {
+        println!("❌ [NVR] Error escribiendo XML temporal: {}", e);
+        return false;
+    }
+
+    let credentials = format!("{}:{}", nvr_user(), nvr_pass());
+    let url = format!("http://{}/ISAPI/ContentMgmt/search", nvr_ip());
+
+    let output = tokio::process::Command::new("curl")
+        .args([
+            "--digest",
+            "-u", &credentials,
+            "-X", "POST",
+            "-H", "Content-Type: application/xml",
+            "-d", &format!("@{}", xml_path.to_string_lossy()),
+            "--silent",
+            "--max-time", "10",
+            &url,
+        ])
+        .output()
+        .await;
+
+    let _ = std::fs::remove_file(&xml_path);
+
+    match output {
+        Ok(out) => {
+            let body = String::from_utf8_lossy(&out.stdout);
+            let disponible = !body.contains("<numOfMatches>0</numOfMatches>")
+                && body.contains("<numOfMatches>");
+            println!("🔍 [NVR] Búsqueda starttime={} → disponible={}", starttime_utc, disponible);
+            disponible
+        }
+        Err(e) => {
+            println!("❌ [NVR] Error ejecutando curl: {}", e);
+            false
+        }
+    }
+}
+
+// Descargar el clip exacto usando ffmpeg + RTSP playback
+async fn descargar_clip_nvr(
+    evento_ts: NaiveDateTime,
+    epc: &str,
+    clips_dir: &std::path::Path,
+) -> Option<String> {
+    let start = evento_ts - chrono::Duration::seconds(clip_margen_antes());
+    let starttime_str = start.format("%Y%m%dT%H%M%SZ").to_string();
+    let duracion = clip_duracion_segs();
+    let endtime_str = (start + chrono::Duration::seconds(duracion as i64))
+        .format("%Y%m%dT%H%M%SZ")
+        .to_string();
+
+    let epc_safe = epc.replace([':', ' '], "");
+    let filename = format!("clip_{}_{}.mp4", epc_safe, evento_ts.format("%Y%m%d_%H%M%S"));
+    let filepath = clips_dir.join(&filename);
+    let filepath_str = filepath.to_string_lossy().to_string();
+
+    let rtsp_url = format!(
+        "rtsp://{}:{}@{}/Streaming/tracks/{}/?starttime={}&endtime={}",
+        nvr_user(), nvr_pass(), nvr_ip(), nvr_track(),
+        starttime_str, endtime_str
+    );
+
+    println!("🎬 [NVR] Descargando clip: {}", filename);
+
+    let output = tokio::process::Command::new("ffmpeg")
+        .args([
+            "-rtsp_transport", "tcp",
+            "-timeout", "5000000",
+            "-i", &rtsp_url,
+            "-t", &duracion.to_string(),
+            "-c:v", "copy",
+            "-an",
+            "-y",
+            &filepath_str,
+        ])
+        .output()
+        .await;
+
+    match output {
+        Ok(out) if out.status.success() => {
+            println!("✅ [NVR] Clip guardado: {}", filepath_str);
+            Some(filepath_str)
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let lines: Vec<&str> = stderr.lines().collect();
+            let ultimas = lines.iter().rev().take(8).rev().cloned().collect::<Vec<_>>().join("\n");
+            println!("❌ [NVR] ffmpeg falló:\n{}", ultimas);
+            None
+        }
+        Err(e) => {
+            println!("❌ [NVR] Error ejecutando ffmpeg: {}", e);
+            None
+        }
+    }
+}
+
+// Tarea en background: espera el delay del NVR, busca el segmento con
+// reintentos, descarga el clip y guarda la ruta en SQLite. Al final
+// envía un SEGUNDO correo con el video adjunto.
+async fn programar_descarga_video(
+    salida_id: i64,
+    epc: String,
+    fecha_lectura: String, // "YYYY-MM-DD HH:MM:SS" tal cual viene de SQLite (UTC)
+    descripcion: String,
+    destinatarios: Vec<String>,
+    db_state: Arc<Mutex<Connection>>,
+    app: AppHandle,
+) {
+    let evento_ts = match NaiveDateTime::parse_from_str(&fecha_lectura, "%Y-%m-%d %H:%M:%S") {
+        Ok(dt) => dt,
+        Err(e) => {
+            println!("❌ [NVR] Error parseando FechaLectura '{}': {}", fecha_lectura, e);
+            return;
+        }
+    };
+
+    println!("⏳ [NVR] Salida ID={} EPC={} — esperando {}s antes de buscar segmento...",
+        salida_id, epc, clip_delay_inicial_segs());
+    tokio::time::sleep(Duration::from_secs(clip_delay_inicial_segs())).await;
+
+    let starttime_search = evento_ts.format("%Y-%m-%dT%H:%M:%S").to_string();
+    let mut disponible = false;
+
+    for intento in 1..=clip_reintentos() {
+        println!("🔍 [NVR] Intento {}/{} buscando segmento para salida ID={}",
+            intento, clip_reintentos(), salida_id);
+        if buscar_segmento_nvr(&starttime_search).await {
+            disponible = true;
+            break;
+        }
+        if intento < clip_reintentos() {
+            tokio::time::sleep(Duration::from_secs(clip_intervalo_reintento_segs())).await;
+        }
+    }
+
+    if !disponible {
+        println!("❌ [NVR] Segmento no disponible tras {} intentos (salida ID={})",
+            clip_reintentos(), salida_id);
+        return;
+    }
+
+    let clips_dir = obtener_clips_dir(&app);
+    if let Some(clip_path) = descargar_clip_nvr(evento_ts, &epc, &clips_dir).await {
+        {
+            let conn = db_state.lock().unwrap();
+            if let Err(e) = conn.execute(
+                "UPDATE LecturasRFID_Salidas SET video_clip = ?1 WHERE Id = ?2",
+                params![clip_path, salida_id],
+            ) {
+                println!("❌ [NVR] Error guardando video_clip en BD: {}", e);
+                return;
+            }
+        }
+        println!("💾 [NVR] video_clip guardado en BD para salida ID={}: {}", salida_id, clip_path);
+
+        let _ = app.emit("video_clip_listo", serde_json::json!({
+            "salida_id": salida_id,
+            "epc": epc,
+            "clip": clip_path
+        }));
+
+        // ── Segundo correo: ahora con el video adjunto ──
+        if !destinatarios.is_empty() {
+            let clip_path_clone = clip_path.clone();
+            let epc_clone = epc.clone();
+            let descripcion_clone = descripcion.clone();
+            tokio::task::spawn_blocking(move || {
+                enviar_email_alerta_con_video(
+                    destinatarios,
+                    &epc_clone,
+                    &descripcion_clone,
+                    Some(&clip_path_clone),
+                );
+            });
+        }
+    }
+}
+
+// ─── FIN MÓDULO NVR ───────────────────────────────────────────────────────────
+
 // ─── INICIALIZAR BASE DE DATOS ────────────────────────────────────────────────
 fn init_db(conn: &Connection) {
     conn.execute_batch(
@@ -150,7 +419,7 @@ fn init_db(conn: &Connection) {
          PRAGMA cache_size = 10000;
          PRAGMA temp_store = MEMORY;
          PRAGMA mmap_size = 268435456;
-         
+
          CREATE TABLE IF NOT EXISTS users (
             id            INTEGER PRIMARY KEY,
             username      TEXT NOT NULL UNIQUE,
@@ -165,11 +434,11 @@ fn init_db(conn: &Connection) {
             FechaLectura TEXT NOT NULL DEFAULT (datetime('now')),
             sincronizado INTEGER NOT NULL DEFAULT 0
          );
-         
+
          CREATE INDEX IF NOT EXISTS idx_epc ON LecturasRFID(EPC);
          CREATE INDEX IF NOT EXISTS idx_fecha ON LecturasRFID(FechaLectura);
          CREATE INDEX IF NOT EXISTS idx_sincronizado ON LecturasRFID(sincronizado);
-         
+
          CREATE TABLE IF NOT EXISTS EQUIPOS_GLEF (
             Id              INTEGER PRIMARY KEY AUTOINCREMENT,
             CODIGO_RFID     TEXT NOT NULL UNIQUE,
@@ -193,7 +462,7 @@ fn init_db(conn: &Connection) {
 
          CREATE INDEX IF NOT EXISTS idx_rfid_codigo ON EQUIPOS_GLEF(CODIGO_RFID);
          CREATE INDEX IF NOT EXISTS idx_salidas_epc ON LecturasRFID_Salidas(EPC);
-         
+
          CREATE TABLE IF NOT EXISTS destinatarios_alerta (
             Id      INTEGER PRIMARY KEY AUTOINCREMENT,
             correo  TEXT NOT NULL UNIQUE,
@@ -202,6 +471,11 @@ fn init_db(conn: &Connection) {
          );",
     )
     .expect("Error creando tablas");
+
+    // ── NUEVO: columna para guardar la ruta del clip de video ──
+    // .ok() porque falla silenciosamente si la columna ya existe
+    conn.execute("ALTER TABLE LecturasRFID_Salidas ADD COLUMN video_clip TEXT", [])
+        .ok();
 
     let count: i64 = conn
         .query_row(
@@ -304,7 +578,7 @@ fn guardar_epcs_batch(conn: &mut Connection, epcs: &[(String, u8)]) {
     if epcs.is_empty() {
         return;
     }
-    
+
     let tx = conn.transaction().expect("Error iniciando transacción");
     for (epc, antena) in epcs {
         tx.execute(
@@ -365,10 +639,10 @@ async fn guardar_epc_server(epc: String, antena: u8) {
 async fn sincronizar_rfid_pendiente(db_state: Arc<Mutex<Connection>>) {
     use tokio::time;
     let mut interval = time::interval(Duration::from_secs(30));
-    
+
     loop {
         interval.tick().await;
-        
+
         let epcs_pendientes: Vec<(String, u8)> = {
             let conn = db_state.lock().unwrap();
             let mut stmt = match conn.prepare(
@@ -383,7 +657,7 @@ async fn sincronizar_rfid_pendiente(db_state: Arc<Mutex<Connection>>) {
                     continue;
                 }
             };
-            
+
             let epcs: Vec<(String, u8)> = match stmt.query_map([], |row| {
                 let epc: String = row.get(0)?;
                 let antena: i32 = row.get(1).unwrap_or(1);
@@ -403,17 +677,17 @@ async fn sincronizar_rfid_pendiente(db_state: Arc<Mutex<Connection>>) {
                     continue;
                 }
             };
-            
+
             epcs
         };
-        
+
         if !epcs_pendientes.is_empty() {
             println!("🔄 Sincronizando {} EPCs con SQL Server...", epcs_pendientes.len());
-            
+
             let mut sincronizados = 0;
             for (epc, antena) in epcs_pendientes {
                 guardar_epc_server(epc.clone(), antena).await;
-                
+
                 let conn = db_state.lock().unwrap();
                 if let Err(e) = conn.execute(
                     "UPDATE LecturasRFID SET sincronizado = 1 WHERE EPC = ?1",
@@ -424,7 +698,7 @@ async fn sincronizar_rfid_pendiente(db_state: Arc<Mutex<Connection>>) {
                     sincronizados += 1;
                 }
             }
-            
+
             println!("✅ {} EPCs sincronizados con SQL Server", sincronizados);
         }
     }
@@ -480,13 +754,13 @@ async fn sincronizar_rfid_manual(db_state: State<'_, DbState>) -> Result<String,
              ORDER BY Id ASC
              LIMIT 100"
         ).map_err(|e| format!("Error preparando consulta: {}", e))?;
-        
+
         let rows = stmt.query_map([], |row| {
             let epc: String = row.get(0)?;
             let antena: i32 = row.get(1).unwrap_or(1);
             Ok((epc, antena as u8))
         }).map_err(|e| format!("Error consultando: {}", e))?;
-        
+
         let mut result = Vec::new();
         for row in rows {
             if let Ok(par) = row {
@@ -495,26 +769,26 @@ async fn sincronizar_rfid_manual(db_state: State<'_, DbState>) -> Result<String,
         }
         result
     };
-    
+
     if epcs_pendientes.is_empty() {
         return Ok("📭 No hay datos pendientes por sincronizar".to_string());
     }
-    
+
     println!("🔄 Sincronizando manualmente {} EPCs...", epcs_pendientes.len());
-    
+
     let mut sincronizados = 0;
     for (epc, antena) in epcs_pendientes {
         guardar_epc_server(epc.clone(), antena).await;
-        
+
         let conn = db_state.0.lock().unwrap();
         conn.execute(
             "UPDATE LecturasRFID SET sincronizado = 1 WHERE EPC = ?1",
             params![epc]
         ).map_err(|e| format!("Error actualizando: {}", e))?;
-        
+
         sincronizados += 1;
     }
-    
+
     Ok(format!("✅ {} EPCs sincronizados con SQL Server", sincronizados))
 }
 
@@ -530,13 +804,13 @@ fn extraer_epc_universal(payload: &[u8]) -> Option<(String, u8)> {
 
     let epc_start = 2;
     let epc_end = payload.len() - 3;
-    
+
     if epc_start >= epc_end {
         return None;
     }
-    
+
     let epc = hex::encode(&payload[epc_start..epc_end]);
-    
+
     if epc.is_empty() {
         None
     } else {
@@ -751,15 +1025,27 @@ async fn sincronizar(state: State<'_, DbState>) -> Result<String, String> {
     ))
 }
 
-// ─── ENVIAR EMAIL DE ALERTA ───────────────────────────────────────────────────
+// ─── ENVIAR EMAIL DE ALERTA (versión rápida, sin video) ──────────────────────
 fn enviar_email_alerta(
     destinatarios: Vec<String>,
     epc: &str,
     descripcion: &str,
 ) {
+    enviar_email_alerta_con_video(destinatarios, epc, descripcion, None);
+}
+
+// ─── ENVIAR EMAIL DE ALERTA, CON SOPORTE OPCIONAL DE VIDEO ADJUNTO ───────────
+// Si clip_path es Some(ruta), adjunta el video. Si es None, manda solo texto
+// (se usa para el primer correo inmediato, antes de que el clip exista).
+fn enviar_email_alerta_con_video(
+    destinatarios: Vec<String>,
+    epc: &str,
+    descripcion: &str,
+    clip_path: Option<&str>,
+) {
     use lettre::{
         Message, SmtpTransport, Transport,
-        message::header::ContentType,
+        message::{header::ContentType, Attachment, MultiPart, SinglePart},
         transport::smtp::authentication::Credentials,
     };
 
@@ -788,36 +1074,79 @@ fn enviar_email_alerta(
         }
     };
 
-    let asunto = format!("🚨 ALERTA: Equipo uso interno detectado saliendo");
+    let asunto = if clip_path.is_some() {
+        "🎬 VIDEO: Captura de la alerta de equipo de uso interno"
+    } else {
+        "🚨 ALERTA: Equipo uso interno detectado saliendo"
+    };
+
     let cuerpo = format!(
         "Se detectó un equipo de uso interno intentando salir.\n\n\
          EPC      : {}\n\
          Equipo   : {}\n\
          Fecha    : {}\n\n\
-         Por favor tome las medidas necesarias.",
+         {}",
         epc,
         descripcion,
-        chrono::Local::now().format("%d/%m/%Y %H:%M:%S")
+        chrono::Local::now().format("%d/%m/%Y %H:%M:%S"),
+        if clip_path.is_some() {
+            "Se adjunta el video de la cámara correspondiente al momento del evento."
+        } else {
+            "Por favor tome las medidas necesarias. El video de respaldo llegará en un correo aparte en unos minutos."
+        }
     );
 
     for correo in &destinatarios {
-        let email = match Message::builder()
-            .from(gmail_user.parse().unwrap())
-            .to(correo.parse().unwrap())
-            .subject(&asunto)
-            .header(ContentType::TEXT_PLAIN)
-            .body(cuerpo.clone())
-        {
-            Ok(e) => e,
-            Err(e) => {
-                println!("❌ Error construyendo email para {}: {}", correo, e);
-                continue;
+        let email = if let Some(path) = clip_path {
+            match std::fs::read(path) {
+                Ok(video_bytes) => {
+                    let filename = std::path::Path::new(path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "clip.mp4".to_string());
+
+                    let attachment = Attachment::new(filename)
+                        .body(video_bytes, "video/mp4".parse().unwrap());
+
+                    Message::builder()
+                        .from(gmail_user.parse().unwrap())
+                        .to(correo.parse().unwrap())
+                        .subject(asunto)
+                        .multipart(
+                            MultiPart::mixed()
+                                .singlepart(
+                                    SinglePart::builder()
+                                        .header(ContentType::TEXT_PLAIN)
+                                        .body(cuerpo.clone())
+                                )
+                                .singlepart(attachment)
+                        )
+                }
+                Err(e) => {
+                    println!("⚠️ No se pudo leer el clip ({}), enviando sin adjunto: {}", path, e);
+                    Message::builder()
+                        .from(gmail_user.parse().unwrap())
+                        .to(correo.parse().unwrap())
+                        .subject(asunto)
+                        .header(ContentType::TEXT_PLAIN)
+                        .body(format!("{}\n\n(No se pudo adjuntar el video)", cuerpo.clone()))
+                }
             }
+        } else {
+            Message::builder()
+                .from(gmail_user.parse().unwrap())
+                .to(correo.parse().unwrap())
+                .subject(asunto)
+                .header(ContentType::TEXT_PLAIN)
+                .body(cuerpo.clone())
         };
 
-        match mailer.send(&email) {
-            Ok(_) => println!("📧 Email enviado a: {}", correo),
-            Err(e) => println!("❌ Error enviando a {}: {}", correo, e),
+        match email {
+            Ok(e) => match mailer.send(&e) {
+                Ok(_) => println!("📧 Email enviado a: {} (con_video={})", correo, clip_path.is_some()),
+                Err(e) => println!("❌ Error enviando a {}: {}", correo, e),
+            },
+            Err(e) => println!("❌ Error construyendo email: {}", e),
         }
     }
 }
@@ -844,13 +1173,13 @@ async fn iniciar_lectura(
         *activo = true;
     }
 
-        // Dar tiempo a que cualquier loop anterior termine
+    // Dar tiempo a que cualquier loop anterior termine
     tokio::time::sleep(Duration::from_millis(300)).await;
-    
+
     let db_state_clone = db_state.0.clone();
-    
+
     let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, u8)>(5000);
-    
+
     let db_state_clone_batch = db_state.0.clone();
     tokio::spawn(async move {
         let mut batch = Vec::with_capacity(200);
@@ -875,29 +1204,29 @@ async fn iniciar_lectura(
             }
         }
     });
-    
+
     let last_seen_global: Arc<tokio::sync::Mutex<HashMap<String, Instant>>> = Arc::new(tokio::sync::Mutex::new(HashMap::with_capacity(1000)));
     let last_seen_salidas: Arc<tokio::sync::Mutex<HashMap<String, Instant>>> = Arc::new(tokio::sync::Mutex::new(HashMap::with_capacity(200)));
     let relay_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<AtomicBool>>>> = 
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    
+
     let mut total_lecturas = 0u32;
     let mut stats_timer = Instant::now();
     let mut stats_count = 0;
     let mut cleanup_counter = 0u32;
-    
+
     let mut buffer: Vec<u8> = Vec::with_capacity(8192);
     let mut temp = [0u8; 8192];
-    
+
     // Conectar e inicializar
     let mut stream = conectar_lector().await?;
     println!("✅ Conectado y configurado");
     app.emit("rfid_estado", "conectado").unwrap();
     println!("📡 Inventario continuo activo");
-    
+
     // Canal para señalar reconexión desde el relay
     let (reconnect_tx, mut reconnect_rx) = tokio::sync::mpsc::channel::<StreamCmd>(100);
-    
+
     while *rfid_state.0.lock().unwrap() {
         if cleanup_counter % 1000 == 0 {
             let now = Instant::now();
@@ -914,9 +1243,9 @@ async fn iniciar_lectura(
             }
         }
         cleanup_counter += 1;
-        
+
         tokio::select! {
-            // Señal de reconexión desde el relay
+                        // Señal de reconexión desde el relay
 // DESPUÉS
             Some(cmd) = reconnect_rx.recv() => {
                 match cmd {
@@ -930,36 +1259,36 @@ async fn iniciar_lectura(
                         let data = [0x09u8, 0x00, 0x00, 0x00];
                         let _ = stream.write_all(&build_command(0xA1, &data)).await;
                     }
-StreamCmd::Reconectar => {
-    println!("🔄 RECONECTAR recibido");
-    println!("🔄 Apagando relay y reactivando inventario...");
+                    StreamCmd::Reconectar => {
+                        println!("🔄 RECONECTAR recibido");
+                        println!("🔄 Apagando relay y reactivando inventario...");
 
-    // PASO 1: Detener inventario
-    let _ = stream.write_all(&build_command(0x8C, &[])).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+                        // PASO 1: Detener inventario
+                        let _ = stream.write_all(&build_command(0x8C, &[])).await;
+                        tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // PASO 1: Apagar relay
-    let data_off = [0x09u8, 0x00, 0x00, 0x00];
-    let _ = stream.write_all(&build_command(0xA1, &data_off)).await;
-    println!("🔒 RELAY OFF enviado");
-    
-    // PASO 2: Esperar bastante más — que el hardware procese el OFF
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    
-    // PASO 3: Reiniciar inventario
-    buffer.clear();
-    let _ = stream.write_all(&build_command(0x93, &[30])).await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let _ = stream.write_all(&build_command(0x82, &[0x00, 0x00])).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    
-    println!("✅ Relay OFF + inventario reactivado");
-    app.emit("rfid_estado", "conectado").unwrap();
-}
+                        // PASO 1: Apagar relay
+                        let data_off = [0x09u8, 0x00, 0x00, 0x00];
+                        let _ = stream.write_all(&build_command(0xA1, &data_off)).await;
+                        println!("🔒 RELAY OFF enviado");
+
+                        // PASO 2: Esperar bastante más — que el hardware procese el OFF
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+
+                        // PASO 3: Reiniciar inventario
+                        buffer.clear();
+                        let _ = stream.write_all(&build_command(0x93, &[30])).await;
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        let _ = stream.write_all(&build_command(0x82, &[0x00, 0x00])).await;
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+
+                        println!("✅ Relay OFF + inventario reactivado");
+                        app.emit("rfid_estado", "conectado").unwrap();
+                    }
                 }
             }
-            
-            // Lectura normal del socket
+
+             // Lectura normal del socket
             result = tokio::time::timeout(Duration::from_millis(10), stream.read(&mut temp)) => {
                 match result {
                     Ok(Ok(n)) if n > 0 => {
@@ -980,9 +1309,9 @@ StreamCmd::Reconectar => {
                                 if payload_end > 5 {
                                     let payload = buffer[5..payload_end].to_vec();
                                     if let Some((epc, antena)) = extraer_epc_universal(&payload) {
-                                       // println!("🏷️ EPC: '{}' | Antena: {}", epc, antena);
+                                        // println!("🏷️ EPC: '{}' | Antena: {}", epc, antena);
                                         let now = Instant::now();
-                                        
+
                                         let debe_procesar = {
                                             let mut global = last_seen_global.lock().await;
                                             if let Some(&last) = global.get(&epc) {
@@ -997,12 +1326,12 @@ StreamCmd::Reconectar => {
                                                 true
                                             }
                                         };
-                                        
+
                                         if !debe_procesar {
                                             buffer.drain(0..length);
                                             continue;
                                         }
-                                        
+
                                         total_lecturas += 1;
                                         stats_count += 1;
                                         if stats_timer.elapsed() >= Duration::from_secs(1) {
@@ -1013,23 +1342,8 @@ StreamCmd::Reconectar => {
                                         }
                                         app.emit("tag_leido", &epc).unwrap();
                                         app.emit("contador_total", &total_lecturas).unwrap();
-                                        
+
                                         if antena == 2 {
-                                            // let procesar = {
-                                            //     let mut salidas = last_seen_salidas.lock().await;
-                                            //     if let Some(&last_salida) = salidas.get(&epc) {
-                                            //         if now.duration_since(last_salida) < Duration::from_secs(5) {
-                                            //             false
-                                            //         } else {
-                                            //             salidas.insert(epc.clone(), now);
-                                            //             true
-                                            //         }
-                                            //     } else {
-                                            //         salidas.insert(epc.clone(), now);
-                                            //         true
-                                            //     }
-                                            // };
-                                            
                                             let relay_locks_clone_inner = relay_locks.clone();
                                             let app_clone_inner = app.clone();
                                             let db_clone_inner = db_state.0.clone();
@@ -1093,7 +1407,7 @@ StreamCmd::Reconectar => {
                                                     let _ = conn.execute(
                                                         "INSERT INTO LecturasRFID_Salidas
                                                         (EPC, Antena, FechaLectura, Alerta)
-                                                        VALUES (?1, 2, datetime('now'), ?2)",
+                                                        VALUES (?1, 2, datetime('now', 'localtime'), ?2)",
                                                         params![&epc_clone, alerta as i32],
                                                     );
                                                     alerta
@@ -1102,68 +1416,99 @@ StreamCmd::Reconectar => {
                                                 println!("🚨 es_alerta: {} para '{}'", es_alerta, epc_clone);
 
 
-if es_alerta {
-    app_clone_inner.emit("alerta_uso_interno", &epc_clone).unwrap();
-    let _ = reconnect_tx_clone.try_send(StreamCmd::RelayOn);
+                                                if es_alerta {
+                                                    app_clone_inner.emit("alerta_uso_interno", &epc_clone).unwrap();
+                                                    let _ = reconnect_tx_clone.try_send(StreamCmd::RelayOn);
 
-    // ── ENVÍO DE EMAIL ──────────────────────────────────────────
-    // Obtener destinatarios y descripción desde SQLite
-    let (destinatarios_correos, descripcion) = {
-        let conn = db_clone_inner.lock().unwrap();
+                                                    // ── ENVÍO DE EMAIL ──────────────────────────────────────────
+                                                    // Obtener Id, FechaLectura, destinatarios y descripción desde SQLite
+                                                    let (salida_id, fecha_lectura, destinatarios_correos, descripcion) = {
+                                                        let conn = db_clone_inner.lock().unwrap();
 
-        // Descripción del equipo
-        let desc = conn.query_row(
-            "SELECT DESCRIPCION FROM EQUIPOS_GLEF WHERE CODIGO_RFID = ?1",
-            params![&epc_clone],
-            |row| row.get::<_, String>(0),
-        ).unwrap_or_else(|_| "Equipo desconocido".to_string());
+                                                        let (id, fecha): (i64, String) = conn.query_row(
+                                                            "SELECT Id, FechaLectura FROM LecturasRFID_Salidas
+                                                             WHERE EPC = ?1
+                                                             ORDER BY Id DESC
+                                                             LIMIT 1",
+                                                            params![&epc_clone],
+                                                            |row| Ok((row.get(0)?, row.get(1)?)),
+                                                        ).unwrap_or((-1, String::new()));
+                                                        // Descripción del equipo
+                                                        let desc = conn.query_row(
+                                                            "SELECT DESCRIPCION FROM EQUIPOS_GLEF WHERE CODIGO_RFID = ?1",
+                                                            params![&epc_clone],
+                                                            |row| row.get::<_, String>(0),
+                                                        ).unwrap_or_else(|_| "Equipo desconocido".to_string());
 
-        // Correos activos
-        let mut stmt = conn.prepare(
-            "SELECT correo FROM destinatarios_alerta WHERE activo = 1"
-        ).unwrap();
-        let correos: Vec<String> = stmt.query_map([], |row| {
-            row.get::<_, String>(0)
-        })
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .collect();
+                                                        // Correos activos
+                                                        let mut stmt = conn.prepare(
+                                                            "SELECT correo FROM destinatarios_alerta WHERE activo = 1"
+                                                        ).unwrap();
+                                                        let correos: Vec<String> = stmt.query_map([], |row| {
+                                                            row.get::<_, String>(0)
+                                                        })
+                                                        .unwrap()
+                                                        .filter_map(|r| r.ok())
+                                                        .collect();
 
-        (correos, desc)
-    };
+                                                        (id, fecha, correos, desc)
+                                                    };
 
-    if !destinatarios_correos.is_empty() {
-        let epc_email = epc_clone.clone();
-        let desc_email = descripcion.clone();
-        // spawn_blocking porque lettre es síncrono
-        tokio::task::spawn_blocking(move || {
-            enviar_email_alerta(destinatarios_correos, &epc_email, &desc_email);
-        });
-    } else {
-        println!("⚠️ Sin destinatarios configurados para alerta de {}", epc_clone);
-    }
-    // ────────────────────────────────────────────────────────────
+                                                    // ── Correo INMEDIATO sin video (igual que antes) ──
+                                                    if !destinatarios_correos.is_empty() {
+                                                        let correos_clone = destinatarios_correos.clone();
+                                                        let epc_email = epc_clone.clone();
+                                                        let desc_email = descripcion.clone();
+                                                        // spawn_blocking porque lettre es síncrono
+                                                        tokio::task::spawn_blocking(move || {
+                                                            enviar_email_alerta(correos_clone, &epc_email, &desc_email);
+                                                        });
+                                                    } else {
+                                                        println!("⚠️ Sin destinatarios configurados para alerta de {}", epc_clone);
+                                                    }
+                                                    // ── NUEVO: lanzar captura de video en background ──
+                                                    if salida_id != -1 {
+                                                        let db_video = db_clone_inner.clone();
+                                                        let app_video = app_clone_inner.clone();
+                                                        let epc_video = epc_clone.clone();
+                                                        let desc_video = descripcion.clone();
+                                                        let correos_video = destinatarios_correos.clone();
 
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    
-    // Reintentar con try_send hasta que el canal tenga espacio
-    let mut enviado = false;
-    for intento in 0..50 {
-        match reconnect_tx_clone.try_send(StreamCmd::Reconectar) {
-            Ok(_) => {
-                println!("📨 Reconectar enviado en intento {}", intento + 1);
-                enviado = true;
-                break;
-            }
-            Err(_) => {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        }
-    }
-    if !enviado {
-        println!("❌ No se pudo enviar Reconectar después de 50 intentos");
-    }
-}
+                                                        tokio::spawn(programar_descarga_video(
+                                                            salida_id,
+                                                            epc_video,
+                                                            fecha_lectura,
+                                                            desc_video,
+                                                            correos_video,
+                                                            db_video,
+                                                            app_video,
+                                                        ));
+                                                    } else {
+                                                        println!("⚠️ [NVR] No se pudo obtener salida_id para EPC={}", epc_clone);
+                                                    }
+                                                    // ── FIN NUEVO ──
+                                        
+                                                    // ───────────────────────────────────────────────────────
+                                                    tokio::time::sleep(Duration::from_secs(5)).await;
+
+                                                    // Reintentar con try_send hasta que el canal tenga espacio
+                                                    let mut enviado = false;
+                                                    for intento in 0..50 {
+                                                        match reconnect_tx_clone.try_send(StreamCmd::Reconectar) {
+                                                            Ok(_) => {
+                                                                println!("📨 Reconectar enviado en intento {}", intento + 1);
+                                                                enviado = true;
+                                                                break;
+                                                            }
+                                                            Err(_) => {
+                                                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                                            }
+                                                        }
+                                                    }
+                                                    if !enviado {
+                                                        println!("❌ No se pudo enviar Reconectar después de 50 intentos");
+                                                    }
+                                                }
 
                                                 // Mantener el lock 10s y luego liberar
                                                 tokio::time::sleep(Duration::from_secs(10)).await;
@@ -1182,7 +1527,7 @@ if es_alerta {
                     Ok(Err(e)) => {
                         println!("Error: {}, reconectando...", e);
                         app.emit("rfid_estado", "reconectando").unwrap();
-                        
+
                         match conectar_lector().await {
                             Ok(new_stream) => {
                                 stream = new_stream;
@@ -1201,7 +1546,7 @@ if es_alerta {
             }
         }
     }
-    
+
     println!("🛑 Lectura detenida - Total: {} lecturas", total_lecturas);
     app.emit("rfid_estado", "detenido").unwrap();
     Ok(())
@@ -1225,7 +1570,7 @@ async fn activar_relay_manual(relay_state: State<'_, RelayState>) -> Result<(), 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     dotenv().ok();
-    
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
@@ -1237,7 +1582,8 @@ pub fn run() {
                 .join("app.db");
 
             println!("📂 Base de datos local SQLite en: {:?}", db_path);
-
+            //Windows
+           // C:\\Users\\lujan\\AppData\\Roaming\\com.lujan.rfid-app-tauri\\app.db
             std::fs::create_dir_all(db_path.parent().unwrap())
                 .expect("Error creando directorio");
 
@@ -1250,8 +1596,8 @@ pub fn run() {
 
             app.manage(db_state);
             app.manage(rfid_state);
-            
-            // 1. Quitamos el guion bajo para usar la variable 'relay_rx'
+
+             // 1. Quitamos el guion bajo para usar la variable 'relay_rx'
             let (relay_tx, mut relay_rx) = tokio::sync::mpsc::channel::<RelayCommand>(30);
             app.manage(RelayState { tx: relay_tx });
 
