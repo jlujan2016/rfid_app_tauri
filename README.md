@@ -47,7 +47,7 @@ Todo el flujo corre dentro de una app de escritorio construida con **Tauri** (fr
 
 Los lectores RFID UHF hacen "inventario continuo" — pueden reportar el mismo tag decenas de veces por segundo mientras permanece en el rango de la antena. El sistema usa **tres capas independientes** para garantizar que cada salida real dispare exactamente un correo y una búsqueda de video, sin duplicados.
 
-![Diagrama de flujo de detección con filtros antiduplicado](diagramas/diagrama1_antiduplicado.png)
+![Diagrama de flujo de detección con filtros antiduplicado](diagramas/diagrama1_antiduplicado.svg)
 
 ### Capa 1 — Filtro global de 50ms (`last_seen_global`)
 
@@ -86,7 +86,7 @@ Solo la verifica la tarea que sí logró tomar el lock. Sirve para el caso de qu
 
 ## 4. Flujo de alerta: correo inmediato + captura de video diferida
 
-![Diagrama de flujo de alerta con correo inmediato, video diferido y operaciones de base de datos](diagramas/diagrama2_alerta_video.png)
+![Diagrama de flujo de alerta con correo inmediato, video diferido y operaciones de base de datos](diagramas/diagrama2_alerta_video.svg)
 
 ### Paso a paso
 

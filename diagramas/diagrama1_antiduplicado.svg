@@ -1,0 +1,79 @@
+<svg width="700" height="780" viewBox="0 0 700 780" xmlns="http://www.w3.org/2000/svg">
+<rect width="700" height="780" fill="#ffffff"/>
+<defs>
+<marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M2 1L8 5L2 9" fill="none" stroke="#3d3d3a" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+</marker>
+</defs>
+<style>
+text { font-family: Arial, sans-serif; fill: #1a1a1a; }
+.th { font-size: 14px; font-weight: 600; }
+.ts { font-size: 12px; fill: #555; }
+.box { fill: #f3f4f6; stroke: #9ca3af; stroke-width: 1; }
+.box-blue { fill: #dbeafe; stroke: #60a5fa; stroke-width: 1; }
+.box-teal { fill: #ccfbf1; stroke: #2dd4bf; stroke-width: 1; }
+.box-coral { fill: #fee2e2; stroke: #f87171; stroke-width: 1; }
+.arr { stroke: #3d3d3a; stroke-width: 1.5; fill: none; }
+.dia { fill: #ffffff; stroke: #9ca3af; stroke-width: 1; }
+</style>
+
+<rect x="250" y="30" width="200" height="44" rx="8" class="box"/>
+<text x="350" y="56" text-anchor="middle" class="th">Tag leído por antena 2</text>
+
+<line x1="350" y1="74" x2="350" y2="110" class="arr" marker-end="url(#arrow)"/>
+
+<rect x="200" y="110" width="300" height="56" rx="8" class="box-blue"/>
+<text x="350" y="132" text-anchor="middle" class="th">Filtro global 50ms</text>
+<text x="350" y="150" text-anchor="middle" class="ts">last_seen_global descarta ruido</text>
+
+<line x1="350" y1="166" x2="350" y2="202" class="arr" marker-end="url(#arrow)"/>
+
+<polygon points="350,202 430,232 350,262 270,232" class="dia"/>
+<text x="350" y="232" text-anchor="middle" class="ts">¿Pasaron &lt;50ms?</text>
+
+<line x1="430" y1="232" x2="570" y2="232" class="arr" marker-end="url(#arrow)"/>
+<text x="500" y="220" text-anchor="middle" class="ts">sí</text>
+<rect x="570" y="210" width="100" height="44" rx="8" class="box"/>
+<text x="620" y="236" text-anchor="middle" class="ts">Descarta</text>
+
+<line x1="350" y1="262" x2="350" y2="298" class="arr" marker-end="url(#arrow)"/>
+<text x="366" y="282" class="ts">no</text>
+
+<rect x="180" y="298" width="340" height="56" rx="8" class="box-teal"/>
+<text x="350" y="320" text-anchor="middle" class="th">Intenta tomar tag_lock atómico</text>
+<text x="350" y="338" text-anchor="middle" class="ts">compare_exchange por EPC</text>
+
+<line x1="350" y1="354" x2="350" y2="390" class="arr" marker-end="url(#arrow)"/>
+
+<polygon points="350,390 440,422 350,454 260,422" class="dia"/>
+<text x="350" y="422" text-anchor="middle" class="ts">¿Lock ya tomado?</text>
+
+<line x1="440" y1="422" x2="590" y2="422" class="arr" marker-end="url(#arrow)"/>
+<text x="515" y="410" text-anchor="middle" class="ts">sí</text>
+<rect x="590" y="400" width="80" height="44" rx="8" class="box"/>
+<text x="630" y="426" text-anchor="middle" class="ts">Sale</text>
+
+<line x1="350" y1="454" x2="350" y2="490" class="arr" marker-end="url(#arrow)"/>
+<text x="366" y="474" class="ts">no</text>
+
+<rect x="180" y="490" width="340" height="56" rx="8" class="box-teal"/>
+<text x="350" y="512" text-anchor="middle" class="th">Debounce 5 segundos</text>
+<text x="350" y="530" text-anchor="middle" class="ts">last_seen_salidas evita repetidos</text>
+
+<line x1="350" y1="546" x2="350" y2="582" class="arr" marker-end="url(#arrow)"/>
+
+<polygon points="350,582 440,614 350,646 260,614" class="dia"/>
+<text x="350" y="614" text-anchor="middle" class="ts">¿Dentro de 5s?</text>
+
+<line x1="440" y1="614" x2="590" y2="614" class="arr" marker-end="url(#arrow)"/>
+<text x="515" y="602" text-anchor="middle" class="ts">sí</text>
+<rect x="590" y="592" width="80" height="44" rx="8" class="box"/>
+<text x="630" y="618" text-anchor="middle" class="ts">Libera lock</text>
+
+<line x1="350" y1="646" x2="350" y2="682" class="arr" marker-end="url(#arrow)"/>
+<text x="366" y="666" class="ts">no</text>
+
+<rect x="180" y="682" width="340" height="56" rx="8" class="box-coral"/>
+<text x="350" y="704" text-anchor="middle" class="th">Verifica es_uso_interno</text>
+<text x="350" y="722" text-anchor="middle" class="ts">INSERT en LecturasRFID_Salidas</text>
+</svg>
